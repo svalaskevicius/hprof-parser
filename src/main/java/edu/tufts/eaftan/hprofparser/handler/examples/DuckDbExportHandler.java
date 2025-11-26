@@ -1,5 +1,5 @@
 /*
- * Handler to export parsed data to a DuckDB database.
+ * Handler to export parsed data to a DuckDB database with batching for performance.
  * Requires DuckDB JDBC dependency in your build system.
  */
 package edu.tufts.eaftan.hprofparser.handler.examples;
@@ -13,15 +13,36 @@ import java.sql.SQLException;
 
 import java.util.HashMap;
 import java.util.Map;
+import java.util.ArrayList;
+import java.util.List;
 
 public class DuckDbExportHandler extends NullRecordHandler {
 
 	private Connection conn;
+	private static final int BATCH_SIZE = 1000;
 
 	// Map from classObjId to its instance fields
 	private Map<Long, InstanceField[]> classInstanceFields = new HashMap<>();
 	// Map from stringId to actual string value
 	private Map<Long, String> stringIdToValue = new HashMap<>();
+
+	// Batched prepared statements
+	private PreparedStatement stringBatch;
+	private PreparedStatement classBatch;
+	private PreparedStatement instanceBatch;
+	private PreparedStatement instanceFieldBatch;
+	private PreparedStatement classDumpBatch;
+	private PreparedStatement objArrayBatch;
+	private PreparedStatement primArrayBatch;
+
+	// Batch counters
+	private int stringBatchCount = 0;
+	private int classBatchCount = 0;
+	private int instanceBatchCount = 0;
+	private int instanceFieldBatchCount = 0;
+	private int classDumpBatchCount = 0;
+	private int objArrayBatchCount = 0;
+	private int primArrayBatchCount = 0;
 
 	// Progress counters
 	private long stringCount = 0;
@@ -34,6 +55,8 @@ public class DuckDbExportHandler extends NullRecordHandler {
 	public DuckDbExportHandler(String dbPath) throws SQLException {
 		// Connect to DuckDB database file
 		conn = DriverManager.getConnection("jdbc:duckdb:" + dbPath);
+		conn.setAutoCommit(false); // Enable manual transaction control for batching
+
 		// Precreate all tables needed for export
 		conn.createStatement()
 				.executeUpdate("CREATE TABLE IF NOT EXISTS strings (id BIGINT PRIMARY KEY, data VARCHAR)");
@@ -53,6 +76,7 @@ public class DuckDbExportHandler extends NullRecordHandler {
 				"CREATE TABLE IF NOT EXISTS obj_arrays (objId BIGINT, stackTraceSerialNum INT, elemClassObjId BIGINT, elems VARCHAR)");
 		conn.createStatement().executeUpdate(
 				"CREATE TABLE IF NOT EXISTS prim_arrays (objId BIGINT, stackTraceSerialNum INT, elemType SMALLINT, elems VARCHAR)");
+
 		// Precreate all root tables
 		conn.createStatement().executeUpdate("CREATE TABLE IF NOT EXISTS root_unknown (col0 BIGINT)");
 		conn.createStatement().executeUpdate("CREATE TABLE IF NOT EXISTS root_jni_global (col0 BIGINT, col1 BIGINT)");
@@ -66,6 +90,23 @@ public class DuckDbExportHandler extends NullRecordHandler {
 		conn.createStatement().executeUpdate("CREATE TABLE IF NOT EXISTS root_monitor_used (col0 BIGINT)");
 		conn.createStatement()
 				.executeUpdate("CREATE TABLE IF NOT EXISTS root_thread_obj (col0 BIGINT, col1 BIGINT, col2 BIGINT)");
+
+		conn.commit();
+
+		// Initialize batched prepared statements
+		stringBatch = conn.prepareStatement("INSERT INTO strings (id, data) VALUES (?, ?) ON CONFLICT (id) DO NOTHING");
+		classBatch = conn.prepareStatement(
+				"INSERT INTO classes (classSerialNum, classObjId, stackTraceSerialNum, classNameStringId) VALUES (?, ?, ?, ?)");
+		instanceBatch = conn
+				.prepareStatement("INSERT INTO instances (objId, stackTraceSerialNum, classObjId) VALUES (?, ?, ?)");
+		instanceFieldBatch = conn.prepareStatement(
+				"INSERT INTO instance_fields (instanceObjId, fieldName, fieldType, fieldValue) VALUES (?, ?, ?, ?)");
+		classDumpBatch = conn.prepareStatement(
+				"INSERT INTO class_dumps (classObjId, stackTraceSerialNum, superClassObjId, classLoaderObjId, signersObjId, protectionDomainObjId, reserved1, reserved2, instanceSize, constants, statics, instanceFields) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+		objArrayBatch = conn.prepareStatement(
+				"INSERT INTO obj_arrays (objId, stackTraceSerialNum, elemClassObjId, elems) VALUES (?, ?, ?, ?)");
+		primArrayBatch = conn.prepareStatement(
+				"INSERT INTO prim_arrays (objId, stackTraceSerialNum, elemType, elems) VALUES (?, ?, ?, ?)");
 	}
 
 	@Override
@@ -75,17 +116,22 @@ public class DuckDbExportHandler extends NullRecordHandler {
 
 	@Override
 	public void stringInUTF8(long id, String data) {
-		// Export string data to DuckDB
 		stringCount++;
 		stringIdToValue.put(id, data);
-		if (stringCount % 1000 == 0) {
-			System.out.println("[DuckDbExport] Exported " + stringCount + " strings");
-		}
-		try (PreparedStatement ps = conn
-				.prepareStatement("INSERT INTO strings (id, data) VALUES (?, ?) ON CONFLICT (id) DO NOTHING")) {
-			ps.setLong(1, id);
-			ps.setString(2, data);
-			ps.executeUpdate();
+
+		try {
+			stringBatch.setLong(1, id);
+			stringBatch.setString(2, data);
+			stringBatch.addBatch();
+			stringBatchCount++;
+
+			if (stringBatchCount >= BATCH_SIZE) {
+				flushStringBatch();
+			}
+
+			if (stringCount % 10000 == 0) {
+				System.out.println("[DuckDbExport] Exported " + stringCount + " strings");
+			}
 		} catch (SQLException e) {
 			e.printStackTrace();
 		}
@@ -93,18 +139,23 @@ public class DuckDbExportHandler extends NullRecordHandler {
 
 	@Override
 	public void loadClass(int classSerialNum, long classObjId, int stackTraceSerialNum, long classNameStringId) {
-		// Export class info to DuckDB
 		classCount++;
-		if (classCount % 1000 == 0) {
-			System.out.println("[DuckDbExport] Exported " + classCount + " classes");
-		}
-		try (PreparedStatement ps = conn.prepareStatement(
-				"INSERT INTO classes (classSerialNum, classObjId, stackTraceSerialNum, classNameStringId) VALUES (?, ?, ?, ?)")) {
-			ps.setInt(1, classSerialNum);
-			ps.setLong(2, classObjId);
-			ps.setInt(3, stackTraceSerialNum);
-			ps.setLong(4, classNameStringId);
-			ps.executeUpdate();
+
+		try {
+			classBatch.setInt(1, classSerialNum);
+			classBatch.setLong(2, classObjId);
+			classBatch.setInt(3, stackTraceSerialNum);
+			classBatch.setLong(4, classNameStringId);
+			classBatch.addBatch();
+			classBatchCount++;
+
+			if (classBatchCount >= BATCH_SIZE) {
+				flushClassBatch();
+			}
+
+			if (classCount % 10000 == 0) {
+				System.out.println("[DuckDbExport] Exported " + classCount + " classes");
+			}
 		} catch (SQLException e) {
 			e.printStackTrace();
 		}
@@ -113,18 +164,17 @@ public class DuckDbExportHandler extends NullRecordHandler {
 	@Override
 	public void startThread(int threadSerialNum, long threadObjectId, int stackTraceSerialNum, long threadNameStringId,
 			long threadGroupNameId, long threadParentGroupNameId) {
-		// Export thread info to DuckDB
-		try {
-			try (PreparedStatement ps = conn.prepareStatement(
-					"INSERT INTO threads (threadSerialNum, threadObjectId, stackTraceSerialNum, threadNameStringId, threadGroupNameId, threadParentGroupNameId) VALUES (?, ?, ?, ?, ?, ?)")) {
-				ps.setInt(1, threadSerialNum);
-				ps.setLong(2, threadObjectId);
-				ps.setInt(3, stackTraceSerialNum);
-				ps.setLong(4, threadNameStringId);
-				ps.setLong(5, threadGroupNameId);
-				ps.setLong(6, threadParentGroupNameId);
-				ps.executeUpdate();
-			}
+		// Threads are typically not numerous, so we can insert directly
+		try (PreparedStatement ps = conn.prepareStatement(
+				"INSERT INTO threads (threadSerialNum, threadObjectId, stackTraceSerialNum, threadNameStringId, threadGroupNameId, threadParentGroupNameId) VALUES (?, ?, ?, ?, ?, ?)")) {
+			ps.setInt(1, threadSerialNum);
+			ps.setLong(2, threadObjectId);
+			ps.setInt(3, stackTraceSerialNum);
+			ps.setLong(4, threadNameStringId);
+			ps.setLong(5, threadGroupNameId);
+			ps.setLong(6, threadParentGroupNameId);
+			ps.executeUpdate();
+			conn.commit();
 		} catch (SQLException e) {
 			e.printStackTrace();
 		}
@@ -133,16 +183,14 @@ public class DuckDbExportHandler extends NullRecordHandler {
 	@Override
 	public void heapSummary(int totalLiveBytes, int totalLiveInstances, long totalBytesAllocated,
 			long totalInstancesAllocated) {
-		// Export heap summary to DuckDB
-		try {
-			try (PreparedStatement ps = conn.prepareStatement(
-					"INSERT INTO heap_summary (totalLiveBytes, totalLiveInstances, totalBytesAllocated, totalInstancesAllocated) VALUES (?, ?, ?, ?)")) {
-				ps.setInt(1, totalLiveBytes);
-				ps.setInt(2, totalLiveInstances);
-				ps.setLong(3, totalBytesAllocated);
-				ps.setLong(4, totalInstancesAllocated);
-				ps.executeUpdate();
-			}
+		try (PreparedStatement ps = conn.prepareStatement(
+				"INSERT INTO heap_summary (totalLiveBytes, totalLiveInstances, totalBytesAllocated, totalInstancesAllocated) VALUES (?, ?, ?, ?)")) {
+			ps.setInt(1, totalLiveBytes);
+			ps.setInt(2, totalLiveInstances);
+			ps.setLong(3, totalBytesAllocated);
+			ps.setLong(4, totalInstancesAllocated);
+			ps.executeUpdate();
+			conn.commit();
 		} catch (SQLException e) {
 			e.printStackTrace();
 		}
@@ -150,34 +198,39 @@ public class DuckDbExportHandler extends NullRecordHandler {
 
 	@Override
 	public void instanceDump(long objId, int stackTraceSerialNum, long classObjId, Value<?>[] instanceFieldValues) {
-		// Export instance dump to DuckDB
 		instanceCount++;
-		if (instanceCount % 1000 == 0) {
-			System.out.println("[DuckDbExport] Exported " + instanceCount + " instances");
-		}
+
 		try {
-			try (PreparedStatement ps = conn.prepareStatement(
-					"INSERT INTO instances (objId, stackTraceSerialNum, classObjId) VALUES (?, ?, ?)")) {
-				ps.setLong(1, objId);
-				ps.setInt(2, stackTraceSerialNum);
-				ps.setLong(3, classObjId);
-				ps.executeUpdate();
+			instanceBatch.setLong(1, objId);
+			instanceBatch.setInt(2, stackTraceSerialNum);
+			instanceBatch.setLong(3, classObjId);
+			instanceBatch.addBatch();
+			instanceBatchCount++;
+
+			if (instanceBatchCount >= BATCH_SIZE) {
+				flushInstanceBatch();
 			}
 
 			// Insert normalized instance fields
 			InstanceField[] fields = classInstanceFields.get(classObjId);
 			if (fields != null && instanceFieldValues != null && fields.length == instanceFieldValues.length) {
 				for (int i = 0; i < fields.length; i++) {
-					try (PreparedStatement fps = conn.prepareStatement(
-							"INSERT INTO instance_fields (instanceObjId, fieldName, fieldType, fieldValue) VALUES (?, ?, ?, ?)")) {
-						fps.setLong(1, objId);
-						fps.setString(2, stringIdToValue.getOrDefault(fields[i].fieldNameStringId,
-								String.valueOf(fields[i].fieldNameStringId)));
-						fps.setString(3, fields[i].type.toString());
-						fps.setString(4, String.valueOf(instanceFieldValues[i]));
-						fps.executeUpdate();
+					instanceFieldBatch.setLong(1, objId);
+					instanceFieldBatch.setString(2, stringIdToValue.getOrDefault(fields[i].fieldNameStringId,
+							String.valueOf(fields[i].fieldNameStringId)));
+					instanceFieldBatch.setString(3, fields[i].type.toString());
+					instanceFieldBatch.setString(4, String.valueOf(instanceFieldValues[i]));
+					instanceFieldBatch.addBatch();
+					instanceFieldBatchCount++;
+
+					if (instanceFieldBatchCount >= BATCH_SIZE) {
+						flushInstanceFieldBatch();
 					}
 				}
+			}
+
+			if (instanceCount % 10000 == 0) {
+				System.out.println("[DuckDbExport] Exported " + instanceCount + " instances");
 			}
 		} catch (SQLException e) {
 			e.printStackTrace();
@@ -188,13 +241,9 @@ public class DuckDbExportHandler extends NullRecordHandler {
 	public void classDump(long classObjId, int stackTraceSerialNum, long superClassObjId, long classLoaderObjId,
 			long signersObjId, long protectionDomainObjId, long reserved1, long reserved2, int instanceSize,
 			Constant[] constants, Static[] statics, InstanceField[] instanceFields) {
-		// Store instance field metadata for normalization
 		classInstanceFields.put(classObjId, instanceFields);
-		// Export class dump to DuckDB
 		classDumpCount++;
-		if (classDumpCount % 1000 == 0) {
-			System.out.println("[DuckDbExport] Exported " + classDumpCount + " class dumps");
-		}
+
 		try {
 			// Serialize arrays
 			StringBuilder constantsSb = new StringBuilder();
@@ -221,21 +270,28 @@ public class DuckDbExportHandler extends NullRecordHandler {
 						fieldsSb.append(",");
 				}
 			}
-			try (PreparedStatement ps = conn.prepareStatement(
-					"INSERT INTO class_dumps (classObjId, stackTraceSerialNum, superClassObjId, classLoaderObjId, signersObjId, protectionDomainObjId, reserved1, reserved2, instanceSize, constants, statics, instanceFields) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")) {
-				ps.setLong(1, classObjId);
-				ps.setInt(2, stackTraceSerialNum);
-				ps.setLong(3, superClassObjId);
-				ps.setLong(4, classLoaderObjId);
-				ps.setLong(5, signersObjId);
-				ps.setLong(6, protectionDomainObjId);
-				ps.setLong(7, reserved1);
-				ps.setLong(8, reserved2);
-				ps.setInt(9, instanceSize);
-				ps.setString(10, constantsSb.toString());
-				ps.setString(11, staticsSb.toString());
-				ps.setString(12, fieldsSb.toString());
-				ps.executeUpdate();
+
+			classDumpBatch.setLong(1, classObjId);
+			classDumpBatch.setInt(2, stackTraceSerialNum);
+			classDumpBatch.setLong(3, superClassObjId);
+			classDumpBatch.setLong(4, classLoaderObjId);
+			classDumpBatch.setLong(5, signersObjId);
+			classDumpBatch.setLong(6, protectionDomainObjId);
+			classDumpBatch.setLong(7, reserved1);
+			classDumpBatch.setLong(8, reserved2);
+			classDumpBatch.setInt(9, instanceSize);
+			classDumpBatch.setString(10, constantsSb.toString());
+			classDumpBatch.setString(11, staticsSb.toString());
+			classDumpBatch.setString(12, fieldsSb.toString());
+			classDumpBatch.addBatch();
+			classDumpBatchCount++;
+
+			if (classDumpBatchCount >= BATCH_SIZE) {
+				flushClassDumpBatch();
+			}
+
+			if (classDumpCount % 10000 == 0) {
+				System.out.println("[DuckDbExport] Exported " + classDumpCount + " class dumps");
 			}
 		} catch (SQLException e) {
 			e.printStackTrace();
@@ -244,11 +300,8 @@ public class DuckDbExportHandler extends NullRecordHandler {
 
 	@Override
 	public void objArrayDump(long objId, int stackTraceSerialNum, long elemClassObjId, long[] elems) {
-		// Export object array dump to DuckDB
 		objArrayCount++;
-		if (objArrayCount % 1000 == 0) {
-			System.out.println("[DuckDbExport] Exported " + objArrayCount + " object arrays");
-		}
+
 		try {
 			StringBuilder sb = new StringBuilder();
 			if (elems != null) {
@@ -258,13 +311,20 @@ public class DuckDbExportHandler extends NullRecordHandler {
 						sb.append(",");
 				}
 			}
-			try (PreparedStatement ps = conn.prepareStatement(
-					"INSERT INTO obj_arrays (objId, stackTraceSerialNum, elemClassObjId, elems) VALUES (?, ?, ?, ?)")) {
-				ps.setLong(1, objId);
-				ps.setInt(2, stackTraceSerialNum);
-				ps.setLong(3, elemClassObjId);
-				ps.setString(4, sb.toString());
-				ps.executeUpdate();
+
+			objArrayBatch.setLong(1, objId);
+			objArrayBatch.setInt(2, stackTraceSerialNum);
+			objArrayBatch.setLong(3, elemClassObjId);
+			objArrayBatch.setString(4, sb.toString());
+			objArrayBatch.addBatch();
+			objArrayBatchCount++;
+
+			if (objArrayBatchCount >= BATCH_SIZE) {
+				flushObjArrayBatch();
+			}
+
+			if (objArrayCount % 10000 == 0) {
+				System.out.println("[DuckDbExport] Exported " + objArrayCount + " object arrays");
 			}
 		} catch (SQLException e) {
 			e.printStackTrace();
@@ -273,11 +333,8 @@ public class DuckDbExportHandler extends NullRecordHandler {
 
 	@Override
 	public void primArrayDump(long objId, int stackTraceSerialNum, byte elemType, Value<?>[] elems) {
-		// Export primitive array dump to DuckDB
 		primArrayCount++;
-		if (primArrayCount % 1000 == 0) {
-			System.out.println("[DuckDbExport] Exported " + primArrayCount + " primitive arrays");
-		}
+
 		try {
 			StringBuilder sb = new StringBuilder();
 			if (elems != null) {
@@ -287,16 +344,80 @@ public class DuckDbExportHandler extends NullRecordHandler {
 						sb.append(",");
 				}
 			}
-			try (PreparedStatement ps = conn.prepareStatement(
-					"INSERT INTO prim_arrays (objId, stackTraceSerialNum, elemType, elems) VALUES (?, ?, ?, ?)")) {
-				ps.setLong(1, objId);
-				ps.setInt(2, stackTraceSerialNum);
-				ps.setShort(3, elemType);
-				ps.setString(4, sb.toString());
-				ps.executeUpdate();
+
+			primArrayBatch.setLong(1, objId);
+			primArrayBatch.setInt(2, stackTraceSerialNum);
+			primArrayBatch.setShort(3, elemType);
+			primArrayBatch.setString(4, sb.toString());
+			primArrayBatch.addBatch();
+			primArrayBatchCount++;
+
+			if (primArrayBatchCount >= BATCH_SIZE) {
+				flushPrimArrayBatch();
+			}
+
+			if (primArrayCount % 10000 == 0) {
+				System.out.println("[DuckDbExport] Exported " + primArrayCount + " primitive arrays");
 			}
 		} catch (SQLException e) {
 			e.printStackTrace();
+		}
+	}
+
+	// Batch flush methods
+	private void flushStringBatch() throws SQLException {
+		if (stringBatchCount > 0) {
+			stringBatch.executeBatch();
+			conn.commit();
+			stringBatchCount = 0;
+		}
+	}
+
+	private void flushClassBatch() throws SQLException {
+		if (classBatchCount > 0) {
+			classBatch.executeBatch();
+			conn.commit();
+			classBatchCount = 0;
+		}
+	}
+
+	private void flushInstanceBatch() throws SQLException {
+		if (instanceBatchCount > 0) {
+			instanceBatch.executeBatch();
+			conn.commit();
+			instanceBatchCount = 0;
+		}
+	}
+
+	private void flushInstanceFieldBatch() throws SQLException {
+		if (instanceFieldBatchCount > 0) {
+			instanceFieldBatch.executeBatch();
+			conn.commit();
+			instanceFieldBatchCount = 0;
+		}
+	}
+
+	private void flushClassDumpBatch() throws SQLException {
+		if (classDumpBatchCount > 0) {
+			classDumpBatch.executeBatch();
+			conn.commit();
+			classDumpBatchCount = 0;
+		}
+	}
+
+	private void flushObjArrayBatch() throws SQLException {
+		if (objArrayBatchCount > 0) {
+			objArrayBatch.executeBatch();
+			conn.commit();
+			objArrayBatchCount = 0;
+		}
+	}
+
+	private void flushPrimArrayBatch() throws SQLException {
+		if (primArrayBatchCount > 0) {
+			primArrayBatch.executeBatch();
+			conn.commit();
+			primArrayBatchCount = 0;
 		}
 	}
 
@@ -346,38 +467,74 @@ public class DuckDbExportHandler extends NullRecordHandler {
 		exportRoot("root_thread_obj", objId, threadSerialNum, stackTraceSerialNum);
 	}
 
-	// Helper for root* records
+	// Helper for root* records (kept as-is since roots are typically not numerous)
 	private void exportRoot(String table, Object... values) {
 		try {
-			// Build table and insert statement dynamically
-			StringBuilder create = new StringBuilder("CREATE TABLE IF NOT EXISTS ").append(table).append(" (");
 			StringBuilder insert = new StringBuilder("INSERT INTO ").append(table).append(" VALUES (");
 			for (int i = 0; i < values.length; i++) {
-				create.append("col").append(i).append(" BIGINT");
 				insert.append("?");
 				if (i < values.length - 1) {
-					create.append(", ");
 					insert.append(", ");
 				}
 			}
-			create.append(")");
 			insert.append(")");
-			conn.createStatement().executeUpdate(create.toString());
+
 			try (PreparedStatement ps = conn.prepareStatement(insert.toString())) {
 				for (int i = 0; i < values.length; i++) {
 					ps.setObject(i + 1, values[i]);
 				}
 				ps.executeUpdate();
 			}
+			conn.commit();
 		} catch (SQLException e) {
 			e.printStackTrace();
 		}
 	}
 
-	// Example for closing connection
+	// Close connection and flush remaining batches
 	public void close() throws SQLException {
-		if (conn != null && !conn.isClosed()) {
-			conn.close();
+		try {
+			// Flush all remaining batches
+			flushStringBatch();
+			flushClassBatch();
+			flushInstanceBatch();
+			flushInstanceFieldBatch();
+			flushClassDumpBatch();
+			flushObjArrayBatch();
+			flushPrimArrayBatch();
+
+			// Close prepared statements
+			if (stringBatch != null)
+				stringBatch.close();
+			if (classBatch != null)
+				classBatch.close();
+			if (instanceBatch != null)
+				instanceBatch.close();
+			if (instanceFieldBatch != null)
+				instanceFieldBatch.close();
+			if (classDumpBatch != null)
+				classDumpBatch.close();
+			if (objArrayBatch != null)
+				objArrayBatch.close();
+			if (primArrayBatch != null)
+				primArrayBatch.close();
+
+			// Close connection
+			if (conn != null && !conn.isClosed()) {
+				conn.commit();
+				conn.close();
+			}
+
+			System.out.println("[DuckDbExport] Export complete. Final counts:");
+			System.out.println("  Strings: " + stringCount);
+			System.out.println("  Classes: " + classCount);
+			System.out.println("  Instances: " + instanceCount);
+			System.out.println("  Class Dumps: " + classDumpCount);
+			System.out.println("  Object Arrays: " + objArrayCount);
+			System.out.println("  Primitive Arrays: " + primArrayCount);
+		} catch (SQLException e) {
+			e.printStackTrace();
+			throw e;
 		}
 	}
 }
