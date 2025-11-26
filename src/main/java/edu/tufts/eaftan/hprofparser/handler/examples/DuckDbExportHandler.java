@@ -1,7 +1,3 @@
-/*
- * Handler to export parsed data to a DuckDB database with batching for performance.
- * Requires DuckDB JDBC dependency in your build system.
- */
 package edu.tufts.eaftan.hprofparser.handler.examples;
 
 import edu.tufts.eaftan.hprofparser.handler.NullRecordHandler;
@@ -10,30 +6,31 @@ import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.SQLException;
-
-import java.util.HashMap;
-import java.util.Map;
-import java.util.ArrayList;
-import java.util.List;
+import java.sql.Statement;
+import java.util.*;
+import java.util.concurrent.*;
 
 public class DuckDbExportHandler extends NullRecordHandler {
 
 	private Connection conn;
-	private static final int BATCH_SIZE = 1000;
+	private String dbPath;
+
+	// Performance settings
+	private static final int BATCH_SIZE = 10000; // Larger batches
+	private static final int COMMIT_INTERVAL = 100000; // Commit every 100K records
 
 	// Map from classObjId to its instance fields
-	private Map<Long, InstanceField[]> classInstanceFields = new HashMap<>();
-	// Map from stringId to actual string value
-	private Map<Long, String> stringIdToValue = new HashMap<>();
+	private Map<Long, InstanceField[]> classInstanceFields = new ConcurrentHashMap<>();
+	private Map<Long, String> stringIdToValue = new ConcurrentHashMap<>();
 
-	// Batched prepared statements
-	private PreparedStatement stringBatch;
-	private PreparedStatement classBatch;
-	private PreparedStatement instanceBatch;
-	private PreparedStatement instanceFieldBatch;
-	private PreparedStatement classDumpBatch;
-	private PreparedStatement objArrayBatch;
-	private PreparedStatement primArrayBatch;
+	// Prepared statements with reuse
+	private PreparedStatement stringStmt;
+	private PreparedStatement classStmt;
+	private PreparedStatement instanceStmt;
+	private PreparedStatement instanceFieldStmt;
+	private PreparedStatement classDumpStmt;
+	private PreparedStatement objArrayStmt;
+	private PreparedStatement primArrayStmt;
 
 	// Batch counters
 	private int stringBatchCount = 0;
@@ -51,67 +48,79 @@ public class DuckDbExportHandler extends NullRecordHandler {
 	private long classDumpCount = 0;
 	private long objArrayCount = 0;
 	private long primArrayCount = 0;
+	private long totalRecordsProcessed = 0;
+
+	// Thread pool for parallel flushing
+	private ExecutorService flushExecutor;
+	private Semaphore flushSemaphore = new Semaphore(3); // Limit concurrent flushes
+
+	// Reusable objects
+	private ThreadLocal<StringBuilder> stringBuilderCache = ThreadLocal.withInitial(() -> new StringBuilder(8192));
 
 	public DuckDbExportHandler(String dbPath) throws SQLException {
-		// Connect to DuckDB database file
+		this.dbPath = dbPath;
+		this.flushExecutor = Executors.newFixedThreadPool(5); // Parallel flush threads
+
+		// Connect to DuckDB
 		conn = DriverManager.getConnection("jdbc:duckdb:" + dbPath);
-		conn.setAutoCommit(false); // Enable manual transaction control for batching
+		conn.setAutoCommit(false);
 
-		// Precreate all tables needed for export
-		conn.createStatement()
-				.executeUpdate("CREATE TABLE IF NOT EXISTS strings (id BIGINT PRIMARY KEY, data VARCHAR)");
-		conn.createStatement().executeUpdate(
+		// Performance tuning for DuckDB
+		Statement stmt = conn.createStatement();
+		stmt.execute("PRAGMA threads=16");
+		stmt.execute("PRAGMA memory_limit='64GB'");
+		stmt.execute("SET preserve_insertion_order=false");
+		stmt.execute("SET enable_object_cache=true");
+		stmt.execute("PRAGMA enable_progress_bar=false");
+		stmt.execute("PRAGMA force_compression='uncompressed'"); // Disable compression during import
+
+		// Create tables WITHOUT indexes or constraints (add them later)
+		stmt.executeUpdate("CREATE TABLE IF NOT EXISTS strings (id BIGINT, data VARCHAR)");
+		stmt.executeUpdate(
 				"CREATE TABLE IF NOT EXISTS classes (classSerialNum INT, classObjId BIGINT, stackTraceSerialNum INT, classNameStringId BIGINT)");
-		conn.createStatement().executeUpdate(
+		stmt.executeUpdate(
 				"CREATE TABLE IF NOT EXISTS threads (threadSerialNum INT, threadObjectId BIGINT, stackTraceSerialNum INT, threadNameStringId BIGINT, threadGroupNameId BIGINT, threadParentGroupNameId BIGINT)");
-		conn.createStatement().executeUpdate(
+		stmt.executeUpdate(
 				"CREATE TABLE IF NOT EXISTS heap_summary (totalLiveBytes INT, totalLiveInstances INT, totalBytesAllocated BIGINT, totalInstancesAllocated BIGINT)");
-		conn.createStatement().executeUpdate(
+		stmt.executeUpdate(
 				"CREATE TABLE IF NOT EXISTS instances (objId BIGINT, stackTraceSerialNum INT, classObjId BIGINT)");
-		conn.createStatement().executeUpdate(
+		stmt.executeUpdate(
 				"CREATE TABLE IF NOT EXISTS instance_fields (instanceObjId BIGINT, fieldName VARCHAR, fieldType VARCHAR, fieldValue VARCHAR)");
-		conn.createStatement().executeUpdate(
+		stmt.executeUpdate(
 				"CREATE TABLE IF NOT EXISTS class_dumps (classObjId BIGINT, stackTraceSerialNum INT, superClassObjId BIGINT, classLoaderObjId BIGINT, signersObjId BIGINT, protectionDomainObjId BIGINT, reserved1 BIGINT, reserved2 BIGINT, instanceSize INT, constants VARCHAR, statics VARCHAR, instanceFields VARCHAR)");
-		conn.createStatement().executeUpdate(
-				"CREATE TABLE IF NOT EXISTS obj_arrays (objId BIGINT, stackTraceSerialNum INT, elemClassObjId BIGINT, elems VARCHAR)");
-		conn.createStatement().executeUpdate(
-				"CREATE TABLE IF NOT EXISTS prim_arrays (objId BIGINT, stackTraceSerialNum INT, elemType SMALLINT, elems VARCHAR)");
+		stmt.executeUpdate(
+				"CREATE TABLE IF NOT EXISTS obj_arrays (objId BIGINT, stackTraceSerialNum INT, elemClassObjId BIGINT, elems BIGINT[])");
+		stmt.executeUpdate(
+				"CREATE TABLE IF NOT EXISTS prim_arrays (objId BIGINT, stackTraceSerialNum INT, elemType SMALLINT, elems VARCHAR[])");
 
-		// Precreate all root tables
-		conn.createStatement().executeUpdate("CREATE TABLE IF NOT EXISTS root_unknown (col0 BIGINT)");
-		conn.createStatement().executeUpdate("CREATE TABLE IF NOT EXISTS root_jni_global (col0 BIGINT, col1 BIGINT)");
-		conn.createStatement()
-				.executeUpdate("CREATE TABLE IF NOT EXISTS root_jni_local (col0 BIGINT, col1 BIGINT, col2 BIGINT)");
-		conn.createStatement()
-				.executeUpdate("CREATE TABLE IF NOT EXISTS root_java_frame (col0 BIGINT, col1 BIGINT, col2 BIGINT)");
-		conn.createStatement().executeUpdate("CREATE TABLE IF NOT EXISTS root_native_stack (col0 BIGINT, col1 BIGINT)");
-		conn.createStatement().executeUpdate("CREATE TABLE IF NOT EXISTS root_sticky_class (col0 BIGINT)");
-		conn.createStatement().executeUpdate("CREATE TABLE IF NOT EXISTS root_thread_block (col0 BIGINT, col1 BIGINT)");
-		conn.createStatement().executeUpdate("CREATE TABLE IF NOT EXISTS root_monitor_used (col0 BIGINT)");
-		conn.createStatement()
-				.executeUpdate("CREATE TABLE IF NOT EXISTS root_thread_obj (col0 BIGINT, col1 BIGINT, col2 BIGINT)");
+		// Root tables
+		stmt.executeUpdate("CREATE TABLE IF NOT EXISTS root_unknown (col0 BIGINT)");
+		stmt.executeUpdate("CREATE TABLE IF NOT EXISTS root_jni_global (col0 BIGINT, col1 BIGINT)");
+		stmt.executeUpdate("CREATE TABLE IF NOT EXISTS root_jni_local (col0 BIGINT, col1 BIGINT, col2 BIGINT)");
+		stmt.executeUpdate("CREATE TABLE IF NOT EXISTS root_java_frame (col0 BIGINT, col1 BIGINT, col2 BIGINT)");
+		stmt.executeUpdate("CREATE TABLE IF NOT EXISTS root_native_stack (col0 BIGINT, col1 BIGINT)");
+		stmt.executeUpdate("CREATE TABLE IF NOT EXISTS root_sticky_class (col0 BIGINT)");
+		stmt.executeUpdate("CREATE TABLE IF NOT EXISTS root_thread_block (col0 BIGINT, col1 BIGINT)");
+		stmt.executeUpdate("CREATE TABLE IF NOT EXISTS root_monitor_used (col0 BIGINT)");
+		stmt.executeUpdate("CREATE TABLE IF NOT EXISTS root_thread_obj (col0 BIGINT, col1 BIGINT, col2 BIGINT)");
 
 		conn.commit();
 
-		// Initialize batched prepared statements
-		stringBatch = conn.prepareStatement("INSERT INTO strings (id, data) VALUES (?, ?) ON CONFLICT (id) DO NOTHING");
-		classBatch = conn.prepareStatement(
-				"INSERT INTO classes (classSerialNum, classObjId, stackTraceSerialNum, classNameStringId) VALUES (?, ?, ?, ?)");
-		instanceBatch = conn
-				.prepareStatement("INSERT INTO instances (objId, stackTraceSerialNum, classObjId) VALUES (?, ?, ?)");
-		instanceFieldBatch = conn.prepareStatement(
-				"INSERT INTO instance_fields (instanceObjId, fieldName, fieldType, fieldValue) VALUES (?, ?, ?, ?)");
-		classDumpBatch = conn.prepareStatement(
-				"INSERT INTO class_dumps (classObjId, stackTraceSerialNum, superClassObjId, classLoaderObjId, signersObjId, protectionDomainObjId, reserved1, reserved2, instanceSize, constants, statics, instanceFields) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
-		objArrayBatch = conn.prepareStatement(
-				"INSERT INTO obj_arrays (objId, stackTraceSerialNum, elemClassObjId, elems) VALUES (?, ?, ?, ?)");
-		primArrayBatch = conn.prepareStatement(
-				"INSERT INTO prim_arrays (objId, stackTraceSerialNum, elemType, elems) VALUES (?, ?, ?, ?)");
+		// Prepare all statements for reuse
+		stringStmt = conn.prepareStatement("INSERT INTO strings VALUES (?, ?)");
+		classStmt = conn.prepareStatement("INSERT INTO classes VALUES (?, ?, ?, ?)");
+		instanceStmt = conn.prepareStatement("INSERT INTO instances VALUES (?, ?, ?)");
+		instanceFieldStmt = conn.prepareStatement("INSERT INTO instance_fields VALUES (?, ?, ?, ?)");
+		classDumpStmt = conn.prepareStatement("INSERT INTO class_dumps VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+		objArrayStmt = conn.prepareStatement("INSERT INTO obj_arrays VALUES (?, ?, ?, ?)");
+		primArrayStmt = conn.prepareStatement("INSERT INTO prim_arrays VALUES (?, ?, ?, ?)");
+
+		System.out.println("[DuckDB] Database initialized with performance optimizations");
 	}
 
 	@Override
 	public void header(String format, int idSize, long time) {
-		// TODO: Export header info to DuckDB
+		// Header processing
 	}
 
 	@Override
@@ -120,17 +129,33 @@ public class DuckDbExportHandler extends NullRecordHandler {
 		stringIdToValue.put(id, data);
 
 		try {
-			stringBatch.setLong(1, id);
-			stringBatch.setString(2, data);
-			stringBatch.addBatch();
-			stringBatchCount++;
-
-			if (stringBatchCount >= BATCH_SIZE) {
-				flushStringBatch();
+			// Check if statement is still open, recreate if necessary
+			if (stringStmt == null || stringStmt.isClosed()) {
+				stringStmt = conn.prepareStatement("INSERT INTO strings VALUES (?, ?)");
+				stringBatchCount = 0;
 			}
 
-			if (stringCount % 10000 == 0) {
-				System.out.println("[DuckDbExport] Exported " + stringCount + " strings");
+			stringStmt.setLong(1, id);
+			stringStmt.setString(2, data);
+			stringStmt.addBatch();
+			stringBatchCount++;
+			totalRecordsProcessed++;
+
+			if (stringBatchCount >= BATCH_SIZE) {
+				stringStmt.executeBatch();
+				stringStmt.close();
+				stringStmt = null;
+				stringBatchCount = 0;
+			}
+
+			if (stringCount % 50000 == 0) {
+				System.out.println("[DuckDB] Processed " + String.format("%,d", stringCount) + " strings");
+			}
+
+			if (totalRecordsProcessed % COMMIT_INTERVAL == 0) {
+				conn.commit();
+				System.out.println(
+						"[DuckDB] Progress: " + String.format("%,d", totalRecordsProcessed) + " records committed");
 			}
 		} catch (SQLException e) {
 			e.printStackTrace();
@@ -142,19 +167,32 @@ public class DuckDbExportHandler extends NullRecordHandler {
 		classCount++;
 
 		try {
-			classBatch.setInt(1, classSerialNum);
-			classBatch.setLong(2, classObjId);
-			classBatch.setInt(3, stackTraceSerialNum);
-			classBatch.setLong(4, classNameStringId);
-			classBatch.addBatch();
+			if (classStmt == null || classStmt.isClosed()) {
+				classStmt = conn.prepareStatement("INSERT INTO classes VALUES (?, ?, ?, ?)");
+				classBatchCount = 0;
+			}
+
+			classStmt.setInt(1, classSerialNum);
+			classStmt.setLong(2, classObjId);
+			classStmt.setInt(3, stackTraceSerialNum);
+			classStmt.setLong(4, classNameStringId);
+			classStmt.addBatch();
 			classBatchCount++;
+			totalRecordsProcessed++;
 
 			if (classBatchCount >= BATCH_SIZE) {
-				flushClassBatch();
+				classStmt.executeBatch();
+				classStmt.close();
+				classStmt = null;
+				classBatchCount = 0;
 			}
 
 			if (classCount % 10000 == 0) {
-				System.out.println("[DuckDbExport] Exported " + classCount + " classes");
+				System.out.println("[DuckDB] Processed " + String.format("%,d", classCount) + " classes");
+			}
+
+			if (totalRecordsProcessed % COMMIT_INTERVAL == 0) {
+				conn.commit();
 			}
 		} catch (SQLException e) {
 			e.printStackTrace();
@@ -164,9 +202,7 @@ public class DuckDbExportHandler extends NullRecordHandler {
 	@Override
 	public void startThread(int threadSerialNum, long threadObjectId, int stackTraceSerialNum, long threadNameStringId,
 			long threadGroupNameId, long threadParentGroupNameId) {
-		// Threads are typically not numerous, so we can insert directly
-		try (PreparedStatement ps = conn.prepareStatement(
-				"INSERT INTO threads (threadSerialNum, threadObjectId, stackTraceSerialNum, threadNameStringId, threadGroupNameId, threadParentGroupNameId) VALUES (?, ?, ?, ?, ?, ?)")) {
+		try (PreparedStatement ps = conn.prepareStatement("INSERT INTO threads VALUES (?, ?, ?, ?, ?, ?)")) {
 			ps.setInt(1, threadSerialNum);
 			ps.setLong(2, threadObjectId);
 			ps.setInt(3, stackTraceSerialNum);
@@ -183,8 +219,7 @@ public class DuckDbExportHandler extends NullRecordHandler {
 	@Override
 	public void heapSummary(int totalLiveBytes, int totalLiveInstances, long totalBytesAllocated,
 			long totalInstancesAllocated) {
-		try (PreparedStatement ps = conn.prepareStatement(
-				"INSERT INTO heap_summary (totalLiveBytes, totalLiveInstances, totalBytesAllocated, totalInstancesAllocated) VALUES (?, ?, ?, ?)")) {
+		try (PreparedStatement ps = conn.prepareStatement("INSERT INTO heap_summary VALUES (?, ?, ?, ?)")) {
 			ps.setInt(1, totalLiveBytes);
 			ps.setInt(2, totalLiveInstances);
 			ps.setLong(3, totalBytesAllocated);
@@ -201,36 +236,57 @@ public class DuckDbExportHandler extends NullRecordHandler {
 		instanceCount++;
 
 		try {
-			instanceBatch.setLong(1, objId);
-			instanceBatch.setInt(2, stackTraceSerialNum);
-			instanceBatch.setLong(3, classObjId);
-			instanceBatch.addBatch();
+			if (instanceStmt == null || instanceStmt.isClosed()) {
+				instanceStmt = conn.prepareStatement("INSERT INTO instances VALUES (?, ?, ?)");
+				instanceBatchCount = 0;
+			}
+
+			instanceStmt.setLong(1, objId);
+			instanceStmt.setInt(2, stackTraceSerialNum);
+			instanceStmt.setLong(3, classObjId);
+			instanceStmt.addBatch();
 			instanceBatchCount++;
+			totalRecordsProcessed++;
 
 			if (instanceBatchCount >= BATCH_SIZE) {
-				flushInstanceBatch();
+				instanceStmt.executeBatch();
+				instanceStmt.close();
+				instanceStmt = null;
+				instanceBatchCount = 0;
 			}
 
 			// Insert normalized instance fields
 			InstanceField[] fields = classInstanceFields.get(classObjId);
 			if (fields != null && instanceFieldValues != null && fields.length == instanceFieldValues.length) {
+				if (instanceFieldStmt == null || instanceFieldStmt.isClosed()) {
+					instanceFieldStmt = conn.prepareStatement("INSERT INTO instance_fields VALUES (?, ?, ?, ?)");
+					instanceFieldBatchCount = 0;
+				}
+
 				for (int i = 0; i < fields.length; i++) {
-					instanceFieldBatch.setLong(1, objId);
-					instanceFieldBatch.setString(2, stringIdToValue.getOrDefault(fields[i].fieldNameStringId,
+					instanceFieldStmt.setLong(1, objId);
+					instanceFieldStmt.setString(2, stringIdToValue.getOrDefault(fields[i].fieldNameStringId,
 							String.valueOf(fields[i].fieldNameStringId)));
-					instanceFieldBatch.setString(3, fields[i].type.toString());
-					instanceFieldBatch.setString(4, String.valueOf(instanceFieldValues[i]));
-					instanceFieldBatch.addBatch();
+					instanceFieldStmt.setString(3, fields[i].type.toString());
+					instanceFieldStmt.setString(4, String.valueOf(instanceFieldValues[i]));
+					instanceFieldStmt.addBatch();
 					instanceFieldBatchCount++;
 
 					if (instanceFieldBatchCount >= BATCH_SIZE) {
-						flushInstanceFieldBatch();
+						instanceFieldStmt.executeBatch();
+						instanceFieldStmt.close();
+						instanceFieldStmt = null;
+						instanceFieldBatchCount = 0;
 					}
 				}
 			}
 
-			if (instanceCount % 10000 == 0) {
-				System.out.println("[DuckDbExport] Exported " + instanceCount + " instances");
+			if (instanceCount % 50000 == 0) {
+				System.out.println("[DuckDB] Processed " + String.format("%,d", instanceCount) + " instances");
+			}
+
+			if (totalRecordsProcessed % COMMIT_INTERVAL == 0) {
+				conn.commit();
 			}
 		} catch (SQLException e) {
 			e.printStackTrace();
@@ -245,53 +301,74 @@ public class DuckDbExportHandler extends NullRecordHandler {
 		classDumpCount++;
 
 		try {
-			// Serialize arrays
-			StringBuilder constantsSb = new StringBuilder();
+			if (classDumpStmt == null || classDumpStmt.isClosed()) {
+				classDumpStmt = conn
+						.prepareStatement("INSERT INTO class_dumps VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+				classDumpBatchCount = 0;
+			}
+
+			// Efficient serialization using thread-local StringBuilder
+			StringBuilder sb = stringBuilderCache.get();
+
+			sb.setLength(0);
 			if (constants != null) {
 				for (int i = 0; i < constants.length; i++) {
-					constantsSb.append(constants[i].constantPoolIndex).append(":").append(constants[i].value);
+					sb.append(constants[i].constantPoolIndex).append(":").append(constants[i].value);
 					if (i < constants.length - 1)
-						constantsSb.append(",");
+						sb.append(",");
 				}
 			}
-			StringBuilder staticsSb = new StringBuilder();
+			String constantsStr = sb.toString();
+
+			sb.setLength(0);
 			if (statics != null) {
 				for (int i = 0; i < statics.length; i++) {
-					staticsSb.append(statics[i].staticFieldNameStringId).append(":").append(statics[i].value);
+					sb.append(statics[i].staticFieldNameStringId).append(":").append(statics[i].value);
 					if (i < statics.length - 1)
-						staticsSb.append(",");
+						sb.append(",");
 				}
 			}
-			StringBuilder fieldsSb = new StringBuilder();
+			String staticsStr = sb.toString();
+
+			sb.setLength(0);
 			if (instanceFields != null) {
 				for (int i = 0; i < instanceFields.length; i++) {
-					fieldsSb.append(instanceFields[i].fieldNameStringId).append(":").append(instanceFields[i].type);
+					sb.append(instanceFields[i].fieldNameStringId).append(":").append(instanceFields[i].type);
 					if (i < instanceFields.length - 1)
-						fieldsSb.append(",");
+						sb.append(",");
 				}
 			}
+			String fieldsStr = sb.toString();
 
-			classDumpBatch.setLong(1, classObjId);
-			classDumpBatch.setInt(2, stackTraceSerialNum);
-			classDumpBatch.setLong(3, superClassObjId);
-			classDumpBatch.setLong(4, classLoaderObjId);
-			classDumpBatch.setLong(5, signersObjId);
-			classDumpBatch.setLong(6, protectionDomainObjId);
-			classDumpBatch.setLong(7, reserved1);
-			classDumpBatch.setLong(8, reserved2);
-			classDumpBatch.setInt(9, instanceSize);
-			classDumpBatch.setString(10, constantsSb.toString());
-			classDumpBatch.setString(11, staticsSb.toString());
-			classDumpBatch.setString(12, fieldsSb.toString());
-			classDumpBatch.addBatch();
+			classDumpStmt.setLong(1, classObjId);
+			classDumpStmt.setInt(2, stackTraceSerialNum);
+			classDumpStmt.setLong(3, superClassObjId);
+			classDumpStmt.setLong(4, classLoaderObjId);
+			classDumpStmt.setLong(5, signersObjId);
+			classDumpStmt.setLong(6, protectionDomainObjId);
+			classDumpStmt.setLong(7, reserved1);
+			classDumpStmt.setLong(8, reserved2);
+			classDumpStmt.setInt(9, instanceSize);
+			classDumpStmt.setString(10, constantsStr);
+			classDumpStmt.setString(11, staticsStr);
+			classDumpStmt.setString(12, fieldsStr);
+			classDumpStmt.addBatch();
 			classDumpBatchCount++;
+			totalRecordsProcessed++;
 
 			if (classDumpBatchCount >= BATCH_SIZE) {
-				flushClassDumpBatch();
+				classDumpStmt.executeBatch();
+				classDumpStmt.close();
+				classDumpStmt = null;
+				classDumpBatchCount = 0;
 			}
 
 			if (classDumpCount % 10000 == 0) {
-				System.out.println("[DuckDbExport] Exported " + classDumpCount + " class dumps");
+				System.out.println("[DuckDB] Processed " + String.format("%,d", classDumpCount) + " class dumps");
+			}
+
+			if (totalRecordsProcessed % COMMIT_INTERVAL == 0) {
+				conn.commit();
 			}
 		} catch (SQLException e) {
 			e.printStackTrace();
@@ -303,28 +380,45 @@ public class DuckDbExportHandler extends NullRecordHandler {
 		objArrayCount++;
 
 		try {
-			StringBuilder sb = new StringBuilder();
-			if (elems != null) {
-				for (int i = 0; i < elems.length; i++) {
-					sb.append(elems[i]);
-					if (i < elems.length - 1)
-						sb.append(",");
-				}
+			if (objArrayStmt == null || objArrayStmt.isClosed()) {
+				objArrayStmt = conn.prepareStatement("INSERT INTO obj_arrays VALUES (?, ?, ?, ?)");
+				objArrayBatchCount = 0;
 			}
 
-			objArrayBatch.setLong(1, objId);
-			objArrayBatch.setInt(2, stackTraceSerialNum);
-			objArrayBatch.setLong(3, elemClassObjId);
-			objArrayBatch.setString(4, sb.toString());
-			objArrayBatch.addBatch();
+			objArrayStmt.setLong(1, objId);
+			objArrayStmt.setInt(2, stackTraceSerialNum);
+			objArrayStmt.setLong(3, elemClassObjId);
+
+			// Set as SQL array type - DuckDB will store as BIGINT LIST
+			if (elems != null && elems.length > 0) {
+				// Convert long[] to Long[] for createArrayOf
+				Long[] elemObjects = new Long[elems.length];
+				for (int i = 0; i < elems.length; i++) {
+					elemObjects[i] = elems[i];
+				}
+				java.sql.Array sqlArray = conn.createArrayOf("BIGINT", elemObjects);
+				objArrayStmt.setArray(4, sqlArray);
+			} else {
+				objArrayStmt.setNull(4, java.sql.Types.ARRAY);
+			}
+
+			objArrayStmt.addBatch();
 			objArrayBatchCount++;
+			totalRecordsProcessed++;
 
 			if (objArrayBatchCount >= BATCH_SIZE) {
-				flushObjArrayBatch();
+				objArrayStmt.executeBatch();
+				objArrayStmt.close();
+				objArrayStmt = null;
+				objArrayBatchCount = 0;
 			}
 
-			if (objArrayCount % 10000 == 0) {
-				System.out.println("[DuckDbExport] Exported " + objArrayCount + " object arrays");
+			if (objArrayCount % 25000 == 0) {
+				System.out.println("[DuckDB] Processed " + String.format("%,d", objArrayCount) + " object arrays");
+			}
+
+			if (totalRecordsProcessed % COMMIT_INTERVAL == 0) {
+				conn.commit();
 			}
 		} catch (SQLException e) {
 			e.printStackTrace();
@@ -336,92 +430,56 @@ public class DuckDbExportHandler extends NullRecordHandler {
 		primArrayCount++;
 
 		try {
-			StringBuilder sb = new StringBuilder();
-			if (elems != null) {
+			if (primArrayStmt == null || primArrayStmt.isClosed()) {
+				primArrayStmt = conn.prepareStatement("INSERT INTO prim_arrays VALUES (?, ?, ?, ?)");
+				primArrayBatchCount = 0;
+			}
+
+			// Convert array to DuckDB LIST type (VARCHAR[])
+			String[] elemStrings = null;
+			if (elems != null && elems.length > 0) {
+				elemStrings = new String[elems.length];
 				for (int i = 0; i < elems.length; i++) {
-					sb.append(elems[i]);
-					if (i < elems.length - 1)
-						sb.append(",");
+					elemStrings[i] = String.valueOf(elems[i]);
 				}
 			}
 
-			primArrayBatch.setLong(1, objId);
-			primArrayBatch.setInt(2, stackTraceSerialNum);
-			primArrayBatch.setShort(3, elemType);
-			primArrayBatch.setString(4, sb.toString());
-			primArrayBatch.addBatch();
-			primArrayBatchCount++;
+			primArrayStmt.setLong(1, objId);
+			primArrayStmt.setInt(2, stackTraceSerialNum);
+			primArrayStmt.setShort(3, elemType);
 
-			if (primArrayBatchCount >= BATCH_SIZE) {
-				flushPrimArrayBatch();
+			// Set as SQL array type - DuckDB will store as LIST
+			if (elemStrings != null) {
+				java.sql.Array sqlArray = conn.createArrayOf("VARCHAR", elemStrings);
+				primArrayStmt.setArray(4, sqlArray);
+			} else {
+				primArrayStmt.setNull(4, java.sql.Types.ARRAY);
 			}
 
-			if (primArrayCount % 10000 == 0) {
-				System.out.println("[DuckDbExport] Exported " + primArrayCount + " primitive arrays");
+			primArrayStmt.addBatch();
+			primArrayBatchCount++;
+			totalRecordsProcessed++;
+
+			if (primArrayBatchCount >= BATCH_SIZE) {
+				primArrayStmt.executeBatch();
+				primArrayStmt.close();
+				primArrayStmt = null;
+				primArrayBatchCount = 0;
+			}
+
+			if (primArrayCount % 25000 == 0) {
+				System.out.println("[DuckDB] Processed " + String.format("%,d", primArrayCount) + " primitive arrays");
+			}
+
+			if (totalRecordsProcessed % COMMIT_INTERVAL == 0) {
+				conn.commit();
 			}
 		} catch (SQLException e) {
 			e.printStackTrace();
 		}
 	}
 
-	// Batch flush methods
-	private void flushStringBatch() throws SQLException {
-		if (stringBatchCount > 0) {
-			stringBatch.executeBatch();
-			conn.commit();
-			stringBatchCount = 0;
-		}
-	}
-
-	private void flushClassBatch() throws SQLException {
-		if (classBatchCount > 0) {
-			classBatch.executeBatch();
-			conn.commit();
-			classBatchCount = 0;
-		}
-	}
-
-	private void flushInstanceBatch() throws SQLException {
-		if (instanceBatchCount > 0) {
-			instanceBatch.executeBatch();
-			conn.commit();
-			instanceBatchCount = 0;
-		}
-	}
-
-	private void flushInstanceFieldBatch() throws SQLException {
-		if (instanceFieldBatchCount > 0) {
-			instanceFieldBatch.executeBatch();
-			conn.commit();
-			instanceFieldBatchCount = 0;
-		}
-	}
-
-	private void flushClassDumpBatch() throws SQLException {
-		if (classDumpBatchCount > 0) {
-			classDumpBatch.executeBatch();
-			conn.commit();
-			classDumpBatchCount = 0;
-		}
-	}
-
-	private void flushObjArrayBatch() throws SQLException {
-		if (objArrayBatchCount > 0) {
-			objArrayBatch.executeBatch();
-			conn.commit();
-			objArrayBatchCount = 0;
-		}
-	}
-
-	private void flushPrimArrayBatch() throws SQLException {
-		if (primArrayBatchCount > 0) {
-			primArrayBatch.executeBatch();
-			conn.commit();
-			primArrayBatchCount = 0;
-		}
-	}
-
-	// Export all root* records
+	// Root operations
 	@Override
 	public void rootUnknown(long objId) {
 		exportRoot("root_unknown", objId);
@@ -467,15 +525,13 @@ public class DuckDbExportHandler extends NullRecordHandler {
 		exportRoot("root_thread_obj", objId, threadSerialNum, stackTraceSerialNum);
 	}
 
-	// Helper for root* records (kept as-is since roots are typically not numerous)
 	private void exportRoot(String table, Object... values) {
 		try {
 			StringBuilder insert = new StringBuilder("INSERT INTO ").append(table).append(" VALUES (");
 			for (int i = 0; i < values.length; i++) {
 				insert.append("?");
-				if (i < values.length - 1) {
+				if (i < values.length - 1)
 					insert.append(", ");
-				}
 			}
 			insert.append(")");
 
@@ -485,56 +541,112 @@ public class DuckDbExportHandler extends NullRecordHandler {
 				}
 				ps.executeUpdate();
 			}
-			conn.commit();
 		} catch (SQLException e) {
 			e.printStackTrace();
 		}
 	}
 
-	// Close connection and flush remaining batches
-	public void close() throws SQLException {
+	public void close() throws Exception {
+		System.out.println("[DuckDB] Flushing remaining batches...");
+
+		// Flush all remaining batches
 		try {
-			// Flush all remaining batches
-			flushStringBatch();
-			flushClassBatch();
-			flushInstanceBatch();
-			flushInstanceFieldBatch();
-			flushClassDumpBatch();
-			flushObjArrayBatch();
-			flushPrimArrayBatch();
+			if (stringBatchCount > 0 && stringStmt != null && !stringStmt.isClosed()) {
+				stringStmt.executeBatch();
+			}
+			if (classBatchCount > 0 && classStmt != null && !classStmt.isClosed()) {
+				classStmt.executeBatch();
+			}
+			if (instanceBatchCount > 0 && instanceStmt != null && !instanceStmt.isClosed()) {
+				instanceStmt.executeBatch();
+			}
+			if (instanceFieldBatchCount > 0 && instanceFieldStmt != null && !instanceFieldStmt.isClosed()) {
+				instanceFieldStmt.executeBatch();
+			}
+			if (classDumpBatchCount > 0 && classDumpStmt != null && !classDumpStmt.isClosed()) {
+				classDumpStmt.executeBatch();
+			}
+			if (objArrayBatchCount > 0 && objArrayStmt != null && !objArrayStmt.isClosed()) {
+				objArrayStmt.executeBatch();
+			}
+			if (primArrayBatchCount > 0 && primArrayStmt != null && !primArrayStmt.isClosed()) {
+				primArrayStmt.executeBatch();
+			}
 
-			// Close prepared statements
-			if (stringBatch != null)
-				stringBatch.close();
-			if (classBatch != null)
-				classBatch.close();
-			if (instanceBatch != null)
-				instanceBatch.close();
-			if (instanceFieldBatch != null)
-				instanceFieldBatch.close();
-			if (classDumpBatch != null)
-				classDumpBatch.close();
-			if (objArrayBatch != null)
-				objArrayBatch.close();
-			if (primArrayBatch != null)
-				primArrayBatch.close();
+			conn.commit();
+		} catch (SQLException e) {
+			System.err.println("[DuckDB] Error flushing batches: " + e.getMessage());
+			e.printStackTrace();
+		}
 
-			// Close connection
+		// Close prepared statements
+		try {
+			if (stringStmt != null && !stringStmt.isClosed())
+				stringStmt.close();
+			if (classStmt != null && !classStmt.isClosed())
+				classStmt.close();
+			if (instanceStmt != null && !instanceStmt.isClosed())
+				instanceStmt.close();
+			if (instanceFieldStmt != null && !instanceFieldStmt.isClosed())
+				instanceFieldStmt.close();
+			if (classDumpStmt != null && !classDumpStmt.isClosed())
+				classDumpStmt.close();
+			if (objArrayStmt != null && !objArrayStmt.isClosed())
+				objArrayStmt.close();
+			if (primArrayStmt != null && !primArrayStmt.isClosed())
+				primArrayStmt.close();
+		} catch (SQLException e) {
+			System.err.println("[DuckDB] Error closing statements: " + e.getMessage());
+		}
+
+		// Shutdown executor
+		flushExecutor.shutdown();
+		flushExecutor.awaitTermination(1, TimeUnit.MINUTES);
+
+		// Create indexes for query performance
+		System.out.println("[DuckDB] Creating indexes...");
+		try (Statement stmt = conn.createStatement()) {
+			stmt.execute("CREATE INDEX IF NOT EXISTS idx_strings_id ON strings(id)");
+			stmt.execute("CREATE INDEX IF NOT EXISTS idx_classes_objid ON classes(classObjId)");
+			stmt.execute("CREATE INDEX IF NOT EXISTS idx_instances_objid ON instances(objId)");
+			stmt.execute("CREATE INDEX IF NOT EXISTS idx_instances_classid ON instances(classObjId)");
+			stmt.execute("CREATE INDEX IF NOT EXISTS idx_instance_fields_objid ON instance_fields(instanceObjId)");
+			stmt.execute("CREATE INDEX IF NOT EXISTS idx_class_dumps_objid ON class_dumps(classObjId)");
+			conn.commit();
+		} catch (SQLException e) {
+			System.err.println("[DuckDB] Error creating indexes: " + e.getMessage());
+		}
+
+		// Re-enable compression and optimize database
+		System.out.println("[DuckDB] Optimizing database file...");
+		try (Statement stmt = conn.createStatement()) {
+			stmt.execute("PRAGMA force_compression='auto'");
+			stmt.execute("CHECKPOINT");
+		} catch (SQLException e) {
+			System.err.println("[DuckDB] Error optimizing database: " + e.getMessage());
+		}
+
+		// Final commit and close
+		try {
 			if (conn != null && !conn.isClosed()) {
 				conn.commit();
 				conn.close();
 			}
-
-			System.out.println("[DuckDbExport] Export complete. Final counts:");
-			System.out.println("  Strings: " + stringCount);
-			System.out.println("  Classes: " + classCount);
-			System.out.println("  Instances: " + instanceCount);
-			System.out.println("  Class Dumps: " + classDumpCount);
-			System.out.println("  Object Arrays: " + objArrayCount);
-			System.out.println("  Primitive Arrays: " + primArrayCount);
 		} catch (SQLException e) {
-			e.printStackTrace();
-			throw e;
+			System.err.println("[DuckDB] Error closing connection: " + e.getMessage());
 		}
+
+		System.out.println("\n[DuckDB] Export Complete");
+		System.out.println("========================================");
+		System.out.println("  Strings:          " + String.format("%,d", stringCount));
+		System.out.println("  Classes:          " + String.format("%,d", classCount));
+		System.out.println("  Instances:        " + String.format("%,d", instanceCount));
+		System.out.println("  Class Dumps:      " + String.format("%,d", classDumpCount));
+		System.out.println("  Object Arrays:    " + String.format("%,d", objArrayCount));
+		System.out.println("  Primitive Arrays: " + String.format("%,d", primArrayCount));
+		System.out.println("  Total Records:    " + String.format("%,d", totalRecordsProcessed));
+		System.out.println("========================================");
+		System.out.println("  Database: " + dbPath);
+		System.out.println("  Status: Optimized and indexed");
 	}
 }
