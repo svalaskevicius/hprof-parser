@@ -11,9 +11,17 @@ import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.SQLException;
 
+import java.util.HashMap;
+import java.util.Map;
+
 public class DuckDbExportHandler extends NullRecordHandler {
 
 	private Connection conn;
+
+	// Map from classObjId to its instance fields
+	private Map<Long, InstanceField[]> classInstanceFields = new HashMap<>();
+	// Map from stringId to actual string value
+	private Map<Long, String> stringIdToValue = new HashMap<>();
 
 	// Progress counters
 	private long stringCount = 0;
@@ -36,7 +44,9 @@ public class DuckDbExportHandler extends NullRecordHandler {
 		conn.createStatement().executeUpdate(
 				"CREATE TABLE IF NOT EXISTS heap_summary (totalLiveBytes INT, totalLiveInstances INT, totalBytesAllocated BIGINT, totalInstancesAllocated BIGINT)");
 		conn.createStatement().executeUpdate(
-				"CREATE TABLE IF NOT EXISTS instances (objId BIGINT, stackTraceSerialNum INT, classObjId BIGINT, instanceFieldValues VARCHAR)");
+				"CREATE TABLE IF NOT EXISTS instances (objId BIGINT, stackTraceSerialNum INT, classObjId BIGINT)");
+		conn.createStatement().executeUpdate(
+				"CREATE TABLE IF NOT EXISTS instance_fields (instanceObjId BIGINT, fieldName VARCHAR, fieldType VARCHAR, fieldValue VARCHAR)");
 		conn.createStatement().executeUpdate(
 				"CREATE TABLE IF NOT EXISTS class_dumps (classObjId BIGINT, stackTraceSerialNum INT, superClassObjId BIGINT, classLoaderObjId BIGINT, signersObjId BIGINT, protectionDomainObjId BIGINT, reserved1 BIGINT, reserved2 BIGINT, instanceSize INT, constants VARCHAR, statics VARCHAR, instanceFields VARCHAR)");
 		conn.createStatement().executeUpdate(
@@ -67,6 +77,7 @@ public class DuckDbExportHandler extends NullRecordHandler {
 	public void stringInUTF8(long id, String data) {
 		// Export string data to DuckDB
 		stringCount++;
+		stringIdToValue.put(id, data);
 		if (stringCount % 1000 == 0) {
 			System.out.println("[DuckDbExport] Exported " + stringCount + " strings");
 		}
@@ -145,22 +156,28 @@ public class DuckDbExportHandler extends NullRecordHandler {
 			System.out.println("[DuckDbExport] Exported " + instanceCount + " instances");
 		}
 		try {
-			// Serialize instanceFieldValues as a comma-separated string
-			StringBuilder sb = new StringBuilder();
-			if (instanceFieldValues != null) {
-				for (int i = 0; i < instanceFieldValues.length; i++) {
-					sb.append(instanceFieldValues[i]);
-					if (i < instanceFieldValues.length - 1)
-						sb.append(",");
-				}
-			}
 			try (PreparedStatement ps = conn.prepareStatement(
-					"INSERT INTO instances (objId, stackTraceSerialNum, classObjId, instanceFieldValues) VALUES (?, ?, ?, ?)")) {
+					"INSERT INTO instances (objId, stackTraceSerialNum, classObjId) VALUES (?, ?, ?)")) {
 				ps.setLong(1, objId);
 				ps.setInt(2, stackTraceSerialNum);
 				ps.setLong(3, classObjId);
-				ps.setString(4, sb.toString());
 				ps.executeUpdate();
+			}
+
+			// Insert normalized instance fields
+			InstanceField[] fields = classInstanceFields.get(classObjId);
+			if (fields != null && instanceFieldValues != null && fields.length == instanceFieldValues.length) {
+				for (int i = 0; i < fields.length; i++) {
+					try (PreparedStatement fps = conn.prepareStatement(
+							"INSERT INTO instance_fields (instanceObjId, fieldName, fieldType, fieldValue) VALUES (?, ?, ?, ?)")) {
+						fps.setLong(1, objId);
+						fps.setString(2, stringIdToValue.getOrDefault(fields[i].fieldNameStringId,
+								String.valueOf(fields[i].fieldNameStringId)));
+						fps.setString(3, fields[i].type.toString());
+						fps.setString(4, String.valueOf(instanceFieldValues[i]));
+						fps.executeUpdate();
+					}
+				}
 			}
 		} catch (SQLException e) {
 			e.printStackTrace();
@@ -171,6 +188,8 @@ public class DuckDbExportHandler extends NullRecordHandler {
 	public void classDump(long classObjId, int stackTraceSerialNum, long superClassObjId, long classLoaderObjId,
 			long signersObjId, long protectionDomainObjId, long reserved1, long reserved2, int instanceSize,
 			Constant[] constants, Static[] statics, InstanceField[] instanceFields) {
+		// Store instance field metadata for normalization
+		classInstanceFields.put(classObjId, instanceFields);
 		// Export class dump to DuckDB
 		classDumpCount++;
 		if (classDumpCount % 1000 == 0) {
