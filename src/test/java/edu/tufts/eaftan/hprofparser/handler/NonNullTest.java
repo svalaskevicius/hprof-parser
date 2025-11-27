@@ -69,7 +69,7 @@ public class NonNullTest {
 
     @Override
     public void instanceDump(long objId, int stackTraceSerialNum, long classObjId,
-        Value<?>[] instanceFieldValues) {
+        InstanceFieldWithValue<?>[] instanceFieldValues) {
       assertThat(instanceFieldValues, notNullValue());
     }
 

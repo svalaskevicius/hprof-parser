@@ -22,6 +22,7 @@ import edu.tufts.eaftan.hprofparser.parser.datastructures.Constant;
 import edu.tufts.eaftan.hprofparser.parser.datastructures.InstanceField;
 import edu.tufts.eaftan.hprofparser.parser.datastructures.Static;
 import edu.tufts.eaftan.hprofparser.parser.datastructures.Value;
+import edu.tufts.eaftan.hprofparser.parser.datastructures.InstanceFieldWithValue;
 
 /**
  * Base class to be used with the hprof parser.  For each record the parser encounters, it parses 
@@ -131,7 +132,7 @@ public class NullRecordHandler implements RecordHandler {
 
   @Override
   public void instanceDump(long objId, int stackTraceSerialNum, 
-      long classObjId, Value<?>[] instanceFieldValues) {}
+      long classObjId, InstanceFieldWithValue<?>[] instanceFieldValues) {}
 
   @Override
   public void objArrayDump(long objId, int stackTraceSerialNum, 

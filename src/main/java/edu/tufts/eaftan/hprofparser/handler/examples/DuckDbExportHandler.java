@@ -307,7 +307,8 @@ public class DuckDbExportHandler extends NullRecordHandler {
 	}
 
 	@Override
-	public void instanceDump(long objId, int stackTraceSerialNum, long classObjId, Value<?>[] instanceFieldValues) {
+	public void instanceDump(long objId, int stackTraceSerialNum, long classObjId,
+			InstanceFieldWithValue<?>[] instanceFieldValues) {
 		instanceCount++;
 		try {
 			instancesAppender.beginRow();
@@ -317,12 +318,8 @@ public class DuckDbExportHandler extends NullRecordHandler {
 			instancesAppender.endRow();
 			totalRecordsProcessed++;
 
-			// Insert normalized instance fields
-			InstanceField[] fields = classInstanceFields.get(classObjId);
-			if (fields != null && instanceFieldValues != null && fields.length == instanceFieldValues.length) {
-				for (int i = 0; i < fields.length; i++) {
-					insertTypedField(objId, fields[i], instanceFieldValues[i]);
-				}
+			for (int i = 0; i < instanceFieldValues.length; i++) {
+				insertTypedField(objId, instanceFieldValues[i]);
 			}
 
 			if (instanceCount % 50_000 == 0) {
@@ -334,10 +331,10 @@ public class DuckDbExportHandler extends NullRecordHandler {
 		}
 	}
 
-	private void insertTypedField(long instanceObjId, InstanceField field, Value<?> value) throws Exception {
-		long fieldNameStringId = field.fieldNameStringId;
+	private void insertTypedField(long instanceObjId, InstanceFieldWithValue<?> value) throws Exception {
+		long fieldNameStringId = value.field.fieldNameStringId;
 
-		switch (field.type) {
+		switch (value.field.type) {
 		case Type.OBJ:
 			instanceFieldsObjectAppender.beginRow();
 			instanceFieldsObjectAppender.append(instanceObjId);
@@ -519,7 +516,8 @@ public class DuckDbExportHandler extends NullRecordHandler {
 				primArraysBooleanAppender.endRow();
 				break;
 			case Type.CHAR:
-                String result = typedElems.stream().collect(StringBuilder::new, StringBuilder::append, StringBuilder::append).toString();
+				String result = typedElems.stream()
+						.collect(StringBuilder::new, StringBuilder::append, StringBuilder::append).toString();
 				primArraysCharAppender.beginRow();
 				primArraysCharAppender.append(objId);
 				primArraysCharAppender.append(stackTraceSerialNum);

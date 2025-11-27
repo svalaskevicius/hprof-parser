@@ -22,6 +22,7 @@ import edu.tufts.eaftan.hprofparser.parser.datastructures.Constant;
 import edu.tufts.eaftan.hprofparser.parser.datastructures.InstanceField;
 import edu.tufts.eaftan.hprofparser.parser.datastructures.Static;
 import edu.tufts.eaftan.hprofparser.parser.datastructures.Value;
+import edu.tufts.eaftan.hprofparser.parser.datastructures.InstanceFieldWithValue;
 
 /**
  * Primary interface to be used with the hprof parser.  The parser takes an implementation of
@@ -116,7 +117,7 @@ public interface RecordHandler {
       InstanceField[] instanceFields);
 
   public abstract void instanceDump(long objId, int stackTraceSerialNum, long classObjId,
-      Value<?>[] instanceFieldValues);
+      InstanceFieldWithValue<?>[] instanceFieldValues);
 
   public abstract void objArrayDump(long objId, int stackTraceSerialNum, long elemClassObjId,
       long[] elems);

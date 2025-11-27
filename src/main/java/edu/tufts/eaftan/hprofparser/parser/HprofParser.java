@@ -28,6 +28,7 @@ import edu.tufts.eaftan.hprofparser.parser.datastructures.InstanceField;
 import edu.tufts.eaftan.hprofparser.parser.datastructures.Static;
 import edu.tufts.eaftan.hprofparser.parser.datastructures.Type;
 import edu.tufts.eaftan.hprofparser.parser.datastructures.Value;
+import edu.tufts.eaftan.hprofparser.parser.datastructures.InstanceFieldWithValue;
 
 import java.io.BufferedInputStream;
 import java.io.ByteArrayInputStream;
@@ -721,7 +722,7 @@ public class HprofParser {
     ByteArrayInputStream bs = new ByteArrayInputStream(i.packedValues);
     DataInputStream input = new DataInputStream(bs);
 
-    ArrayList<Value<?>> values = new ArrayList<>();
+    ArrayList<InstanceFieldWithValue<?>> values = new ArrayList<>();
 
     // superclass of Object is 0
     long nextClass = i.classObjId;
@@ -729,49 +730,49 @@ public class HprofParser {
       ClassInfo ci = classMap.get(nextClass);
       nextClass = ci.superClassObjId;
       for (InstanceField field : ci.instanceFields) {
-        Value<?> v = null;
+        InstanceFieldWithValue<?> v = null;
         switch (field.type) {
           case OBJ:     // object
             long vid = readId(idSize, input);
-            v = new Value<>(field.type, vid);
+            v = new InstanceFieldWithValue<>(field, vid);
             break;
           case BOOL:     // boolean
             boolean vbool = input.readBoolean();
-            v = new Value<>(field.type, vbool);
+            v = new InstanceFieldWithValue<>(field, vbool);
             break;
           case CHAR:     // char
             char vc = input.readChar();
-            v = new Value<>(field.type, vc);
+            v = new InstanceFieldWithValue<>(field, vc);
             break;
           case FLOAT:     // float
             float vf = input.readFloat();
-            v = new Value<>(field.type, vf);
+            v = new InstanceFieldWithValue<>(field, vf);
             break;
           case DOUBLE:     // double
             double vd = input.readDouble();
-            v = new Value<>(field.type, vd);
+            v = new InstanceFieldWithValue<>(field, vd);
             break;
           case BYTE:     // byte
             byte vbyte = input.readByte();
-            v = new Value<>(field.type, vbyte);
+            v = new InstanceFieldWithValue<>(field, vbyte);
             break;
           case SHORT:     // short
             short vs = input.readShort();
-            v = new Value<>(field.type, vs);
+            v = new InstanceFieldWithValue<>(field, vs);
             break;
           case INT:    // int
             int vi = input.readInt();
-            v = new Value<>(field.type, vi);
+            v = new InstanceFieldWithValue<>(field, vi);
             break;
           case LONG:    // long
             long vl = input.readLong();
-            v = new Value<>(field.type, vl);
+            v = new InstanceFieldWithValue<>(field, vl);
             break;
         }
         values.add(v);
       }
     }
-    Value<?>[] valuesArr = new Value[values.size()];
+    InstanceFieldWithValue<?>[] valuesArr = new InstanceFieldWithValue[values.size()];
     valuesArr = values.toArray(valuesArr);
     handler.instanceDump(i.objId, i.stackTraceSerialNum, i.classObjId, valuesArr);
   }

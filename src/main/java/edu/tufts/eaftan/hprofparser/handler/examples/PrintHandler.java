@@ -25,6 +25,7 @@ import edu.tufts.eaftan.hprofparser.parser.datastructures.Constant;
 import edu.tufts.eaftan.hprofparser.parser.datastructures.InstanceField;
 import edu.tufts.eaftan.hprofparser.parser.datastructures.Static;
 import edu.tufts.eaftan.hprofparser.parser.datastructures.Value;
+import edu.tufts.eaftan.hprofparser.parser.datastructures.InstanceFieldWithValue;
 
 import java.text.SimpleDateFormat;
 import java.util.Calendar;
@@ -325,7 +326,7 @@ public class PrintHandler extends NullRecordHandler {
 
   @Override
   public void instanceDump(long objId, int stackTraceSerialNum, 
-      long classObjId, Value<?>[] instanceFieldValues) {
+      long classObjId, InstanceFieldWithValue<?>[] instanceFieldValues) {
     System.out.println("Instance Dump:");
     System.out.println("    object id: " + objId);
     System.out.println("    stack trace serial num: " + stackTraceSerialNum);

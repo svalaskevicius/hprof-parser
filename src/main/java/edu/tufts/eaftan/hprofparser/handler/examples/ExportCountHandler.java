@@ -7,6 +7,7 @@ import edu.tufts.eaftan.hprofparser.parser.datastructures.Constant;
 import edu.tufts.eaftan.hprofparser.parser.datastructures.InstanceField;
 import edu.tufts.eaftan.hprofparser.parser.datastructures.Static;
 import edu.tufts.eaftan.hprofparser.parser.datastructures.Value;
+import edu.tufts.eaftan.hprofparser.parser.datastructures.InstanceFieldWithValue;
 
 import java.util.HashMap;
 
@@ -186,7 +187,7 @@ public class ExportCountHandler extends NullRecordHandler {
 
   @Override
   public void instanceDump(long objId, int stackTraceSerialNum, 
-      long classObjId, Value<?>[] instanceFieldValues) {
+      long classObjId, InstanceFieldWithValue<?>[] instanceFieldValues) {
     instanceDumpCount++;
   }
 

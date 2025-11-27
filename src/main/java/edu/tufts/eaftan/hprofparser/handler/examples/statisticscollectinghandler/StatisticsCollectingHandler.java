@@ -25,6 +25,7 @@ import edu.tufts.eaftan.hprofparser.parser.datastructures.InstanceField;
 import edu.tufts.eaftan.hprofparser.parser.datastructures.Static;
 import edu.tufts.eaftan.hprofparser.parser.datastructures.Type;
 import edu.tufts.eaftan.hprofparser.parser.datastructures.Value;
+import edu.tufts.eaftan.hprofparser.parser.datastructures.InstanceFieldWithValue;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -72,7 +73,7 @@ public class StatisticsCollectingHandler extends NullRecordHandler {
 
   @Override
   public void instanceDump(long objId, int stackTraceSerialNum, long classObjId,
-      Value<?>[] instanceFieldValues) {
+      InstanceFieldWithValue<?>[] instanceFieldValues) {
     ClassInfo classInfo = (ClassInfo) classMap.get(classObjId);
     classInfo.instanceCount++;
   }
