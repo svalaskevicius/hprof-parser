@@ -36,6 +36,7 @@ import com.google.common.collect.Lists;
 
 import edu.tufts.eaftan.hprofparser.handler.examples.PrintHandler;
 import edu.tufts.eaftan.hprofparser.handler.examples.DuckDbExportHandler;
+import edu.tufts.eaftan.hprofparser.handler.examples.ExportCountHandler;
 
 import edu.tufts.eaftan.hprofparser.handler.RecordHandler;
 import edu.tufts.eaftan.hprofparser.parser.HprofParser;
@@ -92,6 +93,9 @@ public class Parse {
 			// Close DuckDB connection if used
 			if (handler instanceof DuckDbExportHandler) {
 				((DuckDbExportHandler) handler).close();
+			}
+			if (handler instanceof ExportCountHandler) {
+				((ExportCountHandler) handler).printCounts();
 			}
 		} catch (Exception e) {
 			System.err.println(e);

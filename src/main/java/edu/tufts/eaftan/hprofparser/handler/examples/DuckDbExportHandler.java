@@ -2,44 +2,71 @@ package edu.tufts.eaftan.hprofparser.handler.examples;
 
 import edu.tufts.eaftan.hprofparser.handler.NullRecordHandler;
 import edu.tufts.eaftan.hprofparser.parser.datastructures.*;
+import org.duckdb.DuckDBAppender;
+import org.duckdb.DuckDBConnection;
+
 import java.sql.Connection;
 import java.sql.DriverManager;
-import java.sql.PreparedStatement;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.*;
 import java.util.concurrent.*;
 
+import java.util.Arrays;
+import java.util.List;
+import java.util.Collections;
+import java.util.stream.Collectors;
+
+/**
+ * Rewritten to use DuckDB Appender API for high-throughput bulk inserts. - One
+ * Appender per target table (created once) - append(beginRow/append/endRow)
+ * used for each row - periodic commits to control transaction size - arrays are
+ * passed as Java arrays (Long[], String[], etc.) which DuckDB maps to LIST
+ */
 public class DuckDbExportHandler extends NullRecordHandler {
 
 	private Connection conn;
+	private DuckDBConnection dconn;
 	private String dbPath;
 
 	// Performance settings
-	private static final int BATCH_SIZE = 10000; // Larger batches
-	private static final int COMMIT_INTERVAL = 100000; // Commit every 100K records
+	private static final int COMMIT_INTERVAL = 100_000; // commit after this many rows overall
 
 	// Map from classObjId to its instance fields
 	private Map<Long, InstanceField[]> classInstanceFields = new ConcurrentHashMap<>();
 	private Map<Long, String> stringIdToValue = new ConcurrentHashMap<>();
 
-	// Prepared statements with reuse
-	private PreparedStatement stringStmt;
-	private PreparedStatement classStmt;
-	private PreparedStatement instanceStmt;
-	private PreparedStatement instanceFieldStmt;
-	private PreparedStatement classDumpStmt;
-	private PreparedStatement objArrayStmt;
-	private PreparedStatement primArrayStmt;
+	// Appenders
+	private DuckDBAppender stringsAppender;
+	private DuckDBAppender classesAppender;
+	private DuckDBAppender threadsAppender;
+	private DuckDBAppender heapSummaryAppender;
+	private DuckDBAppender instancesAppender;
+	private DuckDBAppender classDumpsAppender;
+	private DuckDBAppender objArraysAppender;
+	private DuckDBAppender primArraysAppender;
 
-	// Batch counters
-	private int stringBatchCount = 0;
-	private int classBatchCount = 0;
-	private int instanceBatchCount = 0;
-	private int instanceFieldBatchCount = 0;
-	private int classDumpBatchCount = 0;
-	private int objArrayBatchCount = 0;
-	private int primArrayBatchCount = 0;
+	// Type-specific instance field tables
+	private DuckDBAppender instanceFieldsObjectAppender;
+	private DuckDBAppender instanceFieldsBooleanAppender;
+	private DuckDBAppender instanceFieldsCharAppender;
+	private DuckDBAppender instanceFieldsFloatAppender;
+	private DuckDBAppender instanceFieldsDoubleAppender;
+	private DuckDBAppender instanceFieldsByteAppender;
+	private DuckDBAppender instanceFieldsShortAppender;
+	private DuckDBAppender instanceFieldsIntAppender;
+	private DuckDBAppender instanceFieldsLongAppender;
+
+	// Root appenders
+	private DuckDBAppender rootUnknownAppender;
+	private DuckDBAppender rootJniGlobalAppender;
+	private DuckDBAppender rootJniLocalAppender;
+	private DuckDBAppender rootJavaFrameAppender;
+	private DuckDBAppender rootNativeStackAppender;
+	private DuckDBAppender rootStickyClassAppender;
+	private DuckDBAppender rootThreadBlockAppender;
+	private DuckDBAppender rootMonitorUsedAppender;
+	private DuckDBAppender rootThreadObjAppender;
 
 	// Progress counters
 	private long stringCount = 0;
@@ -50,114 +77,141 @@ public class DuckDbExportHandler extends NullRecordHandler {
 	private long primArrayCount = 0;
 	private long totalRecordsProcessed = 0;
 
-	// Thread pool for parallel flushing
-	private ExecutorService flushExecutor;
-	private Semaphore flushSemaphore = new Semaphore(3); // Limit concurrent flushes
-
 	// Reusable objects
 	private ThreadLocal<StringBuilder> stringBuilderCache = ThreadLocal.withInitial(() -> new StringBuilder(8192));
 
 	public DuckDbExportHandler(String dbPath) throws SQLException {
 		this.dbPath = dbPath;
-		this.flushExecutor = Executors.newFixedThreadPool(5); // Parallel flush threads
+		try {
+			conn = DriverManager.getConnection("jdbc:duckdb:" + dbPath);
+			conn.setAutoCommit(false);
+			// DuckDB JDBC connection is also an org.duckdb.DuckDBConnection
+			dconn = (DuckDBConnection) conn;
 
-		// Connect to DuckDB
-		conn = DriverManager.getConnection("jdbc:duckdb:" + dbPath);
-		conn.setAutoCommit(false);
+			// Performance tuning for DuckDB
+			try (Statement stmt = conn.createStatement()) {
+				stmt.execute("PRAGMA threads=16");
+				stmt.execute("PRAGMA memory_limit='64GB'");
+				stmt.execute("SET preserve_insertion_order=false");
+				stmt.execute("SET enable_object_cache=true");
+				stmt.execute("PRAGMA enable_progress_bar=false");
+				stmt.execute("PRAGMA force_compression='uncompressed'"); // Disable compression during import
 
-		// Performance tuning for DuckDB
-		Statement stmt = conn.createStatement();
-		stmt.execute("PRAGMA threads=16");
-		stmt.execute("PRAGMA memory_limit='64GB'");
-		stmt.execute("SET preserve_insertion_order=false");
-		stmt.execute("SET enable_object_cache=true");
-		stmt.execute("PRAGMA enable_progress_bar=false");
-		stmt.execute("PRAGMA force_compression='uncompressed'"); // Disable compression during import
+				// Create tables WITHOUT indexes or constraints (add them later)
+				stmt.executeUpdate("CREATE TABLE IF NOT EXISTS strings (id BIGINT, data VARCHAR)");
+				stmt.executeUpdate(
+						"CREATE TABLE IF NOT EXISTS classes (classSerialNum INT, classObjId BIGINT, stackTraceSerialNum INT, classNameStringId BIGINT)");
+				stmt.executeUpdate(
+						"CREATE TABLE IF NOT EXISTS threads (threadSerialNum INT, threadObjectId BIGINT, stackTraceSerialNum INT, threadNameStringId BIGINT, threadGroupNameId BIGINT, threadParentGroupNameId BIGINT)");
+				stmt.executeUpdate(
+						"CREATE TABLE IF NOT EXISTS heap_summary (totalLiveBytes INT, totalLiveInstances INT, totalBytesAllocated BIGINT, totalInstancesAllocated BIGINT)");
+				stmt.executeUpdate(
+						"CREATE TABLE IF NOT EXISTS instances (objId BIGINT, stackTraceSerialNum INT, classObjId BIGINT)");
+				stmt.executeUpdate(
+						"CREATE TABLE IF NOT EXISTS class_dumps (classObjId BIGINT, stackTraceSerialNum INT, superClassObjId BIGINT, classLoaderObjId BIGINT, signersObjId BIGINT, protectionDomainObjId BIGINT, reserved1 BIGINT, reserved2 BIGINT, instanceSize INT, constants VARCHAR, statics VARCHAR, instanceFields VARCHAR)");
+				stmt.executeUpdate(
+						"CREATE TABLE IF NOT EXISTS obj_arrays (objId BIGINT, stackTraceSerialNum INT, elemClassObjId BIGINT, elems BIGINT[])");
+				stmt.executeUpdate(
+						"CREATE TABLE IF NOT EXISTS prim_arrays (objId BIGINT, stackTraceSerialNum INT, elemType SMALLINT, elems VARCHAR[])");
 
-		// Create tables WITHOUT indexes or constraints (add them later)
-		stmt.executeUpdate("CREATE TABLE IF NOT EXISTS strings (id BIGINT, data VARCHAR)");
-		stmt.executeUpdate(
-				"CREATE TABLE IF NOT EXISTS classes (classSerialNum INT, classObjId BIGINT, stackTraceSerialNum INT, classNameStringId BIGINT)");
-		stmt.executeUpdate(
-				"CREATE TABLE IF NOT EXISTS threads (threadSerialNum INT, threadObjectId BIGINT, stackTraceSerialNum INT, threadNameStringId BIGINT, threadGroupNameId BIGINT, threadParentGroupNameId BIGINT)");
-		stmt.executeUpdate(
-				"CREATE TABLE IF NOT EXISTS heap_summary (totalLiveBytes INT, totalLiveInstances INT, totalBytesAllocated BIGINT, totalInstancesAllocated BIGINT)");
-		stmt.executeUpdate(
-				"CREATE TABLE IF NOT EXISTS instances (objId BIGINT, stackTraceSerialNum INT, classObjId BIGINT)");
-		stmt.executeUpdate(
-				"CREATE TABLE IF NOT EXISTS instance_fields (instanceObjId BIGINT, fieldName VARCHAR, fieldType VARCHAR, fieldValue VARCHAR)");
-		stmt.executeUpdate(
-				"CREATE TABLE IF NOT EXISTS class_dumps (classObjId BIGINT, stackTraceSerialNum INT, superClassObjId BIGINT, classLoaderObjId BIGINT, signersObjId BIGINT, protectionDomainObjId BIGINT, reserved1 BIGINT, reserved2 BIGINT, instanceSize INT, constants VARCHAR, statics VARCHAR, instanceFields VARCHAR)");
-		stmt.executeUpdate(
-				"CREATE TABLE IF NOT EXISTS obj_arrays (objId BIGINT, stackTraceSerialNum INT, elemClassObjId BIGINT, elems BIGINT[])");
-		stmt.executeUpdate(
-				"CREATE TABLE IF NOT EXISTS prim_arrays (objId BIGINT, stackTraceSerialNum INT, elemType SMALLINT, elems VARCHAR[])");
+				// Type-specific instance field tables
+				stmt.executeUpdate(
+						"CREATE TABLE IF NOT EXISTS instance_fields_object (instanceObjId BIGINT, fieldNameStringId BIGINT, fieldValue BIGINT)");
+				stmt.executeUpdate(
+						"CREATE TABLE IF NOT EXISTS instance_fields_boolean (instanceObjId BIGINT, fieldNameStringId BIGINT, fieldValue BOOLEAN)");
+				stmt.executeUpdate(
+						"CREATE TABLE IF NOT EXISTS instance_fields_char (instanceObjId BIGINT, fieldNameStringId BIGINT, fieldValue VARCHAR)");
+				stmt.executeUpdate(
+						"CREATE TABLE IF NOT EXISTS instance_fields_float (instanceObjId BIGINT, fieldNameStringId BIGINT, fieldValue FLOAT)");
+				stmt.executeUpdate(
+						"CREATE TABLE IF NOT EXISTS instance_fields_double (instanceObjId BIGINT, fieldNameStringId BIGINT, fieldValue DOUBLE)");
+				stmt.executeUpdate(
+						"CREATE TABLE IF NOT EXISTS instance_fields_byte (instanceObjId BIGINT, fieldNameStringId BIGINT, fieldValue TINYINT)");
+				stmt.executeUpdate(
+						"CREATE TABLE IF NOT EXISTS instance_fields_short (instanceObjId BIGINT, fieldNameStringId BIGINT, fieldValue SMALLINT)");
+				stmt.executeUpdate(
+						"CREATE TABLE IF NOT EXISTS instance_fields_int (instanceObjId BIGINT, fieldNameStringId BIGINT, fieldValue INTEGER)");
+				stmt.executeUpdate(
+						"CREATE TABLE IF NOT EXISTS instance_fields_long (instanceObjId BIGINT, fieldNameStringId BIGINT, fieldValue BIGINT)");
 
-		// Root tables
-		stmt.executeUpdate("CREATE TABLE IF NOT EXISTS root_unknown (col0 BIGINT)");
-		stmt.executeUpdate("CREATE TABLE IF NOT EXISTS root_jni_global (col0 BIGINT, col1 BIGINT)");
-		stmt.executeUpdate("CREATE TABLE IF NOT EXISTS root_jni_local (col0 BIGINT, col1 BIGINT, col2 BIGINT)");
-		stmt.executeUpdate("CREATE TABLE IF NOT EXISTS root_java_frame (col0 BIGINT, col1 BIGINT, col2 BIGINT)");
-		stmt.executeUpdate("CREATE TABLE IF NOT EXISTS root_native_stack (col0 BIGINT, col1 BIGINT)");
-		stmt.executeUpdate("CREATE TABLE IF NOT EXISTS root_sticky_class (col0 BIGINT)");
-		stmt.executeUpdate("CREATE TABLE IF NOT EXISTS root_thread_block (col0 BIGINT, col1 BIGINT)");
-		stmt.executeUpdate("CREATE TABLE IF NOT EXISTS root_monitor_used (col0 BIGINT)");
-		stmt.executeUpdate("CREATE TABLE IF NOT EXISTS root_thread_obj (col0 BIGINT, col1 BIGINT, col2 BIGINT)");
+				// Root tables
+				stmt.executeUpdate("CREATE TABLE IF NOT EXISTS root_unknown (objId BIGINT)");
+				stmt.executeUpdate("CREATE TABLE IF NOT EXISTS root_jni_global (objId BIGINT, jniGlobalRefId BIGINT)");
+				stmt.executeUpdate(
+						"CREATE TABLE IF NOT EXISTS root_jni_local (objId BIGINT, threadSerialNum INT, frameNum INT)");
+				stmt.executeUpdate(
+						"CREATE TABLE IF NOT EXISTS root_java_frame (objId BIGINT, threadSerialNum INT, frameNum INT)");
+				stmt.executeUpdate("CREATE TABLE IF NOT EXISTS root_native_stack (objId BIGINT, threadSerialNum INT)");
+				stmt.executeUpdate("CREATE TABLE IF NOT EXISTS root_sticky_class (objId BIGINT)");
+				stmt.executeUpdate("CREATE TABLE IF NOT EXISTS root_thread_block (objId BIGINT, threadSerialNum INT)");
+				stmt.executeUpdate("CREATE TABLE IF NOT EXISTS root_monitor_used (objId BIGINT)");
+				stmt.executeUpdate(
+						"CREATE TABLE IF NOT EXISTS root_thread_obj (objId BIGINT, threadSerialNum INT, stackTraceSerialNum INT)");
+			}
 
-		conn.commit();
+			conn.commit();
 
-		// Prepare all statements for reuse
-		stringStmt = conn.prepareStatement("INSERT INTO strings VALUES (?, ?)");
-		classStmt = conn.prepareStatement("INSERT INTO classes VALUES (?, ?, ?, ?)");
-		instanceStmt = conn.prepareStatement("INSERT INTO instances VALUES (?, ?, ?)");
-		instanceFieldStmt = conn.prepareStatement("INSERT INTO instance_fields VALUES (?, ?, ?, ?)");
-		classDumpStmt = conn.prepareStatement("INSERT INTO class_dumps VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
-		objArrayStmt = conn.prepareStatement("INSERT INTO obj_arrays VALUES (?, ?, ?, ?)");
-		primArrayStmt = conn.prepareStatement("INSERT INTO prim_arrays VALUES (?, ?, ?, ?)");
+			// Create one appender per table (namespace "main")
+			stringsAppender = dconn.createAppender("main", "strings");
+			classesAppender = dconn.createAppender("main", "classes");
+			threadsAppender = dconn.createAppender("main", "threads");
+			heapSummaryAppender = dconn.createAppender("main", "heap_summary");
+			instancesAppender = dconn.createAppender("main", "instances");
+			classDumpsAppender = dconn.createAppender("main", "class_dumps");
+			objArraysAppender = dconn.createAppender("main", "obj_arrays");
+			primArraysAppender = dconn.createAppender("main", "prim_arrays");
 
-		System.out.println("[DuckDB] Database initialized with performance optimizations");
+			// Type-specific appenders
+			instanceFieldsObjectAppender = dconn.createAppender("main", "instance_fields_object");
+			instanceFieldsBooleanAppender = dconn.createAppender("main", "instance_fields_boolean");
+			instanceFieldsCharAppender = dconn.createAppender("main", "instance_fields_char");
+			instanceFieldsFloatAppender = dconn.createAppender("main", "instance_fields_float");
+			instanceFieldsDoubleAppender = dconn.createAppender("main", "instance_fields_double");
+			instanceFieldsByteAppender = dconn.createAppender("main", "instance_fields_byte");
+			instanceFieldsShortAppender = dconn.createAppender("main", "instance_fields_short");
+			instanceFieldsIntAppender = dconn.createAppender("main", "instance_fields_int");
+			instanceFieldsLongAppender = dconn.createAppender("main", "instance_fields_long");
+
+			rootUnknownAppender = dconn.createAppender("main", "root_unknown");
+			rootJniGlobalAppender = dconn.createAppender("main", "root_jni_global");
+			rootJniLocalAppender = dconn.createAppender("main", "root_jni_local");
+			rootJavaFrameAppender = dconn.createAppender("main", "root_java_frame");
+			rootNativeStackAppender = dconn.createAppender("main", "root_native_stack");
+			rootStickyClassAppender = dconn.createAppender("main", "root_sticky_class");
+			rootThreadBlockAppender = dconn.createAppender("main", "root_thread_block");
+			rootMonitorUsedAppender = dconn.createAppender("main", "root_monitor_used");
+			rootThreadObjAppender = dconn.createAppender("main", "root_thread_obj");
+
+			System.out.println("[DuckDB] Database initialized with Appender API and performance optimizations");
+		} catch (SQLException e) {
+			// ensure partial resources cleaned up
+			closeQuiet();
+			throw e;
+		}
 	}
 
 	@Override
 	public void header(String format, int idSize, long time) {
-		// Header processing
+		// no-op
 	}
 
 	@Override
 	public void stringInUTF8(long id, String data) {
 		stringCount++;
 		stringIdToValue.put(id, data);
-
 		try {
-			// Check if statement is still open, recreate if necessary
-			if (stringStmt == null || stringStmt.isClosed()) {
-				stringStmt = conn.prepareStatement("INSERT INTO strings VALUES (?, ?)");
-				stringBatchCount = 0;
-			}
+			stringsAppender.beginRow();
+			stringsAppender.append(id);
+			stringsAppender.append(data);
+			stringsAppender.endRow();
 
-			stringStmt.setLong(1, id);
-			stringStmt.setString(2, data);
-			stringStmt.addBatch();
-			stringBatchCount++;
 			totalRecordsProcessed++;
-
-			if (stringBatchCount >= BATCH_SIZE) {
-				stringStmt.executeBatch();
-				stringStmt.close();
-				stringStmt = null;
-				stringBatchCount = 0;
-			}
-
-			if (stringCount % 50000 == 0) {
+			if (stringCount % 50_000 == 0) {
 				System.out.println("[DuckDB] Processed " + String.format("%,d", stringCount) + " strings");
 			}
 
-			if (totalRecordsProcessed % COMMIT_INTERVAL == 0) {
-				conn.commit();
-				System.out.println(
-						"[DuckDB] Progress: " + String.format("%,d", totalRecordsProcessed) + " records committed");
-			}
-		} catch (SQLException e) {
+			periodicCommitIfNeeded();
+		} catch (Exception e) {
 			e.printStackTrace();
 		}
 	}
@@ -165,36 +219,20 @@ public class DuckDbExportHandler extends NullRecordHandler {
 	@Override
 	public void loadClass(int classSerialNum, long classObjId, int stackTraceSerialNum, long classNameStringId) {
 		classCount++;
-
 		try {
-			if (classStmt == null || classStmt.isClosed()) {
-				classStmt = conn.prepareStatement("INSERT INTO classes VALUES (?, ?, ?, ?)");
-				classBatchCount = 0;
-			}
+			classesAppender.beginRow();
+			classesAppender.append(classSerialNum);
+			classesAppender.append(classObjId);
+			classesAppender.append(stackTraceSerialNum);
+			classesAppender.append(classNameStringId);
+			classesAppender.endRow();
 
-			classStmt.setInt(1, classSerialNum);
-			classStmt.setLong(2, classObjId);
-			classStmt.setInt(3, stackTraceSerialNum);
-			classStmt.setLong(4, classNameStringId);
-			classStmt.addBatch();
-			classBatchCount++;
 			totalRecordsProcessed++;
-
-			if (classBatchCount >= BATCH_SIZE) {
-				classStmt.executeBatch();
-				classStmt.close();
-				classStmt = null;
-				classBatchCount = 0;
-			}
-
-			if (classCount % 10000 == 0) {
+			if (classCount % 10_000 == 0) {
 				System.out.println("[DuckDB] Processed " + String.format("%,d", classCount) + " classes");
 			}
-
-			if (totalRecordsProcessed % COMMIT_INTERVAL == 0) {
-				conn.commit();
-			}
-		} catch (SQLException e) {
+			periodicCommitIfNeeded();
+		} catch (Exception e) {
 			e.printStackTrace();
 		}
 	}
@@ -202,16 +240,18 @@ public class DuckDbExportHandler extends NullRecordHandler {
 	@Override
 	public void startThread(int threadSerialNum, long threadObjectId, int stackTraceSerialNum, long threadNameStringId,
 			long threadGroupNameId, long threadParentGroupNameId) {
-		try (PreparedStatement ps = conn.prepareStatement("INSERT INTO threads VALUES (?, ?, ?, ?, ?, ?)")) {
-			ps.setInt(1, threadSerialNum);
-			ps.setLong(2, threadObjectId);
-			ps.setInt(3, stackTraceSerialNum);
-			ps.setLong(4, threadNameStringId);
-			ps.setLong(5, threadGroupNameId);
-			ps.setLong(6, threadParentGroupNameId);
-			ps.executeUpdate();
-			conn.commit();
-		} catch (SQLException e) {
+		try {
+			threadsAppender.beginRow();
+			threadsAppender.append(threadSerialNum);
+			threadsAppender.append(threadObjectId);
+			threadsAppender.append(stackTraceSerialNum);
+			threadsAppender.append(threadNameStringId);
+			threadsAppender.append(threadGroupNameId);
+			threadsAppender.append(threadParentGroupNameId);
+			threadsAppender.endRow();
+			totalRecordsProcessed++;
+			conn.commit(); // threads are small and infrequent; commit immediately to avoid holding locks
+		} catch (Exception e) {
 			e.printStackTrace();
 		}
 	}
@@ -219,14 +259,16 @@ public class DuckDbExportHandler extends NullRecordHandler {
 	@Override
 	public void heapSummary(int totalLiveBytes, int totalLiveInstances, long totalBytesAllocated,
 			long totalInstancesAllocated) {
-		try (PreparedStatement ps = conn.prepareStatement("INSERT INTO heap_summary VALUES (?, ?, ?, ?)")) {
-			ps.setInt(1, totalLiveBytes);
-			ps.setInt(2, totalLiveInstances);
-			ps.setLong(3, totalBytesAllocated);
-			ps.setLong(4, totalInstancesAllocated);
-			ps.executeUpdate();
+		try {
+			heapSummaryAppender.beginRow();
+			heapSummaryAppender.append(totalLiveBytes);
+			heapSummaryAppender.append(totalLiveInstances);
+			heapSummaryAppender.append(totalBytesAllocated);
+			heapSummaryAppender.append(totalInstancesAllocated);
+			heapSummaryAppender.endRow();
+			totalRecordsProcessed++;
 			conn.commit();
-		} catch (SQLException e) {
+		} catch (Exception e) {
 			e.printStackTrace();
 		}
 	}
@@ -234,63 +276,108 @@ public class DuckDbExportHandler extends NullRecordHandler {
 	@Override
 	public void instanceDump(long objId, int stackTraceSerialNum, long classObjId, Value<?>[] instanceFieldValues) {
 		instanceCount++;
-
 		try {
-			if (instanceStmt == null || instanceStmt.isClosed()) {
-				instanceStmt = conn.prepareStatement("INSERT INTO instances VALUES (?, ?, ?)");
-				instanceBatchCount = 0;
-			}
-
-			instanceStmt.setLong(1, objId);
-			instanceStmt.setInt(2, stackTraceSerialNum);
-			instanceStmt.setLong(3, classObjId);
-			instanceStmt.addBatch();
-			instanceBatchCount++;
+			instancesAppender.beginRow();
+			instancesAppender.append(objId);
+			instancesAppender.append(stackTraceSerialNum);
+			instancesAppender.append(classObjId);
+			instancesAppender.endRow();
 			totalRecordsProcessed++;
-
-			if (instanceBatchCount >= BATCH_SIZE) {
-				instanceStmt.executeBatch();
-				instanceStmt.close();
-				instanceStmt = null;
-				instanceBatchCount = 0;
-			}
 
 			// Insert normalized instance fields
 			InstanceField[] fields = classInstanceFields.get(classObjId);
 			if (fields != null && instanceFieldValues != null && fields.length == instanceFieldValues.length) {
-				if (instanceFieldStmt == null || instanceFieldStmt.isClosed()) {
-					instanceFieldStmt = conn.prepareStatement("INSERT INTO instance_fields VALUES (?, ?, ?, ?)");
-					instanceFieldBatchCount = 0;
-				}
-
 				for (int i = 0; i < fields.length; i++) {
-					instanceFieldStmt.setLong(1, objId);
-					instanceFieldStmt.setString(2, stringIdToValue.getOrDefault(fields[i].fieldNameStringId,
-							String.valueOf(fields[i].fieldNameStringId)));
-					instanceFieldStmt.setString(3, fields[i].type.toString());
-					instanceFieldStmt.setString(4, String.valueOf(instanceFieldValues[i]));
-					instanceFieldStmt.addBatch();
-					instanceFieldBatchCount++;
-
-					if (instanceFieldBatchCount >= BATCH_SIZE) {
-						instanceFieldStmt.executeBatch();
-						instanceFieldStmt.close();
-						instanceFieldStmt = null;
-						instanceFieldBatchCount = 0;
-					}
+					insertTypedField(objId, fields[i], instanceFieldValues[i]);
 				}
 			}
 
-			if (instanceCount % 50000 == 0) {
+			if (instanceCount % 50_000 == 0) {
 				System.out.println("[DuckDB] Processed " + String.format("%,d", instanceCount) + " instances");
 			}
-
-			if (totalRecordsProcessed % COMMIT_INTERVAL == 0) {
-				conn.commit();
-			}
-		} catch (SQLException e) {
+			periodicCommitIfNeeded();
+		} catch (Exception e) {
 			e.printStackTrace();
 		}
+	}
+
+	private void insertTypedField(long instanceObjId, InstanceField field, Value<?> value) throws Exception {
+		long fieldNameStringId = field.fieldNameStringId;
+
+		switch (field.type) {
+		case Type.OBJ:
+			instanceFieldsObjectAppender.beginRow();
+			instanceFieldsObjectAppender.append(instanceObjId);
+			instanceFieldsObjectAppender.append(fieldNameStringId);
+			instanceFieldsObjectAppender.append(value.value != null ? ((Number) value.value).longValue() : 0L);
+			instanceFieldsObjectAppender.endRow();
+			break;
+
+		case Type.BOOL:
+			instanceFieldsBooleanAppender.beginRow();
+			instanceFieldsBooleanAppender.append(instanceObjId);
+			instanceFieldsBooleanAppender.append(fieldNameStringId);
+			instanceFieldsBooleanAppender.append(value.value != null ? (Boolean) value.value : false);
+			instanceFieldsBooleanAppender.endRow();
+			break;
+
+		case Type.CHAR:
+			instanceFieldsCharAppender.beginRow();
+			instanceFieldsCharAppender.append(instanceObjId);
+			instanceFieldsCharAppender.append(fieldNameStringId);
+			instanceFieldsCharAppender.append(value.value != null ? String.valueOf(value.value) : "");
+			instanceFieldsCharAppender.endRow();
+			break;
+
+		case Type.FLOAT:
+			instanceFieldsFloatAppender.beginRow();
+			instanceFieldsFloatAppender.append(instanceObjId);
+			instanceFieldsFloatAppender.append(fieldNameStringId);
+			instanceFieldsFloatAppender.append(value.value != null ? ((Number) value.value).floatValue() : 0.0f);
+			instanceFieldsFloatAppender.endRow();
+			break;
+
+		case Type.DOUBLE:
+			instanceFieldsDoubleAppender.beginRow();
+			instanceFieldsDoubleAppender.append(instanceObjId);
+			instanceFieldsDoubleAppender.append(fieldNameStringId);
+			instanceFieldsDoubleAppender.append(value.value != null ? ((Number) value.value).doubleValue() : 0.0);
+			instanceFieldsDoubleAppender.endRow();
+			break;
+
+		case Type.BYTE:
+			instanceFieldsByteAppender.beginRow();
+			instanceFieldsByteAppender.append(instanceObjId);
+			instanceFieldsByteAppender.append(fieldNameStringId);
+			instanceFieldsByteAppender.append(value.value != null ? ((Number) value.value).byteValue() : (byte) 0);
+			instanceFieldsByteAppender.endRow();
+			break;
+
+		case Type.SHORT:
+			instanceFieldsShortAppender.beginRow();
+			instanceFieldsShortAppender.append(instanceObjId);
+			instanceFieldsShortAppender.append(fieldNameStringId);
+			instanceFieldsShortAppender.append(value.value != null ? ((Number) value.value).shortValue() : (short) 0);
+			instanceFieldsShortAppender.endRow();
+			break;
+
+		case Type.INT:
+			instanceFieldsIntAppender.beginRow();
+			instanceFieldsIntAppender.append(instanceObjId);
+			instanceFieldsIntAppender.append(fieldNameStringId);
+			instanceFieldsIntAppender.append(value.value != null ? ((Number) value.value).intValue() : 0);
+			instanceFieldsIntAppender.endRow();
+			break;
+
+		case Type.LONG:
+			instanceFieldsLongAppender.beginRow();
+			instanceFieldsLongAppender.append(instanceObjId);
+			instanceFieldsLongAppender.append(fieldNameStringId);
+			instanceFieldsLongAppender.append(value.value != null ? ((Number) value.value).longValue() : 0L);
+			instanceFieldsLongAppender.endRow();
+			break;
+		}
+		totalRecordsProcessed++;
 	}
 
 	@Override
@@ -299,14 +386,7 @@ public class DuckDbExportHandler extends NullRecordHandler {
 			Constant[] constants, Static[] statics, InstanceField[] instanceFields) {
 		classInstanceFields.put(classObjId, instanceFields);
 		classDumpCount++;
-
 		try {
-			if (classDumpStmt == null || classDumpStmt.isClosed()) {
-				classDumpStmt = conn
-						.prepareStatement("INSERT INTO class_dumps VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
-				classDumpBatchCount = 0;
-			}
-
 			// Efficient serialization using thread-local StringBuilder
 			StringBuilder sb = stringBuilderCache.get();
 
@@ -340,37 +420,28 @@ public class DuckDbExportHandler extends NullRecordHandler {
 			}
 			String fieldsStr = sb.toString();
 
-			classDumpStmt.setLong(1, classObjId);
-			classDumpStmt.setInt(2, stackTraceSerialNum);
-			classDumpStmt.setLong(3, superClassObjId);
-			classDumpStmt.setLong(4, classLoaderObjId);
-			classDumpStmt.setLong(5, signersObjId);
-			classDumpStmt.setLong(6, protectionDomainObjId);
-			classDumpStmt.setLong(7, reserved1);
-			classDumpStmt.setLong(8, reserved2);
-			classDumpStmt.setInt(9, instanceSize);
-			classDumpStmt.setString(10, constantsStr);
-			classDumpStmt.setString(11, staticsStr);
-			classDumpStmt.setString(12, fieldsStr);
-			classDumpStmt.addBatch();
-			classDumpBatchCount++;
+			classDumpsAppender.beginRow();
+			classDumpsAppender.append(classObjId);
+			classDumpsAppender.append(stackTraceSerialNum);
+			classDumpsAppender.append(superClassObjId);
+			classDumpsAppender.append(classLoaderObjId);
+			classDumpsAppender.append(signersObjId);
+			classDumpsAppender.append(protectionDomainObjId);
+			classDumpsAppender.append(reserved1);
+			classDumpsAppender.append(reserved2);
+			classDumpsAppender.append(instanceSize);
+			classDumpsAppender.append(constantsStr);
+			classDumpsAppender.append(staticsStr);
+			classDumpsAppender.append(fieldsStr);
+			classDumpsAppender.endRow();
 			totalRecordsProcessed++;
 
-			if (classDumpBatchCount >= BATCH_SIZE) {
-				classDumpStmt.executeBatch();
-				classDumpStmt.close();
-				classDumpStmt = null;
-				classDumpBatchCount = 0;
-			}
-
-			if (classDumpCount % 10000 == 0) {
+			if (classDumpCount % 10_000 == 0) {
 				System.out.println("[DuckDB] Processed " + String.format("%,d", classDumpCount) + " class dumps");
 			}
 
-			if (totalRecordsProcessed % COMMIT_INTERVAL == 0) {
-				conn.commit();
-			}
-		} catch (SQLException e) {
+			periodicCommitIfNeeded();
+		} catch (Exception e) {
 			e.printStackTrace();
 		}
 	}
@@ -378,49 +449,23 @@ public class DuckDbExportHandler extends NullRecordHandler {
 	@Override
 	public void objArrayDump(long objId, int stackTraceSerialNum, long elemClassObjId, long[] elems) {
 		objArrayCount++;
-
 		try {
-			if (objArrayStmt == null || objArrayStmt.isClosed()) {
-				objArrayStmt = conn.prepareStatement("INSERT INTO obj_arrays VALUES (?, ?, ?, ?)");
-				objArrayBatchCount = 0;
-			}
+			objArraysAppender.beginRow();
+			objArraysAppender.append(objId);
+			objArraysAppender.append(stackTraceSerialNum);
+			objArraysAppender.append(elemClassObjId);
 
-			objArrayStmt.setLong(1, objId);
-			objArrayStmt.setInt(2, stackTraceSerialNum);
-			objArrayStmt.setLong(3, elemClassObjId);
+			objArraysAppender.append(elems);
 
-			// Set as SQL array type - DuckDB will store as BIGINT LIST
-			if (elems != null && elems.length > 0) {
-				// Convert long[] to Long[] for createArrayOf
-				Long[] elemObjects = new Long[elems.length];
-				for (int i = 0; i < elems.length; i++) {
-					elemObjects[i] = elems[i];
-				}
-				java.sql.Array sqlArray = conn.createArrayOf("BIGINT", elemObjects);
-				objArrayStmt.setArray(4, sqlArray);
-			} else {
-				objArrayStmt.setNull(4, java.sql.Types.ARRAY);
-			}
-
-			objArrayStmt.addBatch();
-			objArrayBatchCount++;
+			objArraysAppender.endRow();
 			totalRecordsProcessed++;
 
-			if (objArrayBatchCount >= BATCH_SIZE) {
-				objArrayStmt.executeBatch();
-				objArrayStmt.close();
-				objArrayStmt = null;
-				objArrayBatchCount = 0;
-			}
-
-			if (objArrayCount % 25000 == 0) {
+			if (objArrayCount % 25_000 == 0) {
 				System.out.println("[DuckDB] Processed " + String.format("%,d", objArrayCount) + " object arrays");
 			}
 
-			if (totalRecordsProcessed % COMMIT_INTERVAL == 0) {
-				conn.commit();
-			}
-		} catch (SQLException e) {
+			periodicCommitIfNeeded();
+		} catch (Exception e) {
 			e.printStackTrace();
 		}
 	}
@@ -428,118 +473,160 @@ public class DuckDbExportHandler extends NullRecordHandler {
 	@Override
 	public void primArrayDump(long objId, int stackTraceSerialNum, byte elemType, Value<?>[] elems) {
 		primArrayCount++;
-
 		try {
-			if (primArrayStmt == null || primArrayStmt.isClosed()) {
-				primArrayStmt = conn.prepareStatement("INSERT INTO prim_arrays VALUES (?, ?, ?, ?)");
-				primArrayBatchCount = 0;
-			}
+			primArraysAppender.beginRow();
+			primArraysAppender.append(objId);
+			primArraysAppender.append(stackTraceSerialNum);
+			primArraysAppender.append((short) elemType);
 
-			// Convert array to DuckDB LIST type (VARCHAR[])
-			String[] elemStrings = null;
-			if (elems != null && elems.length > 0) {
-				elemStrings = new String[elems.length];
-				for (int i = 0; i < elems.length; i++) {
-					elemStrings[i] = String.valueOf(elems[i]);
-				}
-			}
+			primArraysAppender.append(Arrays.stream(elems).map(String::valueOf).collect(Collectors.toList()));
 
-			primArrayStmt.setLong(1, objId);
-			primArrayStmt.setInt(2, stackTraceSerialNum);
-			primArrayStmt.setShort(3, elemType);
-
-			// Set as SQL array type - DuckDB will store as LIST
-			if (elemStrings != null) {
-				java.sql.Array sqlArray = conn.createArrayOf("VARCHAR", elemStrings);
-				primArrayStmt.setArray(4, sqlArray);
-			} else {
-				primArrayStmt.setNull(4, java.sql.Types.ARRAY);
-			}
-
-			primArrayStmt.addBatch();
-			primArrayBatchCount++;
+			primArraysAppender.endRow();
 			totalRecordsProcessed++;
 
-			if (primArrayBatchCount >= BATCH_SIZE) {
-				primArrayStmt.executeBatch();
-				primArrayStmt.close();
-				primArrayStmt = null;
-				primArrayBatchCount = 0;
-			}
-
-			if (primArrayCount % 25000 == 0) {
+			if (primArrayCount % 25_000 == 0) {
 				System.out.println("[DuckDB] Processed " + String.format("%,d", primArrayCount) + " primitive arrays");
 			}
 
-			if (totalRecordsProcessed % COMMIT_INTERVAL == 0) {
-				conn.commit();
-			}
-		} catch (SQLException e) {
+			periodicCommitIfNeeded();
+		} catch (Exception e) {
 			e.printStackTrace();
 		}
 	}
 
-	// Root operations
+	// Root operations use per-table appenders created above
 	@Override
 	public void rootUnknown(long objId) {
-		exportRoot("root_unknown", objId);
+		try {
+			rootUnknownAppender.beginRow();
+			rootUnknownAppender.append(objId);
+			rootUnknownAppender.endRow();
+			totalRecordsProcessed++;
+			periodicCommitIfNeeded();
+		} catch (Exception e) {
+			e.printStackTrace();
+		}
 	}
 
 	@Override
 	public void rootJNIGlobal(long objId, long JNIGlobalRefId) {
-		exportRoot("root_jni_global", objId, JNIGlobalRefId);
+		try {
+			rootJniGlobalAppender.beginRow();
+			rootJniGlobalAppender.append(objId);
+			rootJniGlobalAppender.append(JNIGlobalRefId);
+			rootJniGlobalAppender.endRow();
+			totalRecordsProcessed++;
+			periodicCommitIfNeeded();
+		} catch (Exception e) {
+			e.printStackTrace();
+		}
 	}
 
 	@Override
 	public void rootJNILocal(long objId, int threadSerialNum, int frameNum) {
-		exportRoot("root_jni_local", objId, threadSerialNum, frameNum);
+		try {
+			rootJniLocalAppender.beginRow();
+			rootJniLocalAppender.append(objId);
+			rootJniLocalAppender.append(threadSerialNum);
+			rootJniLocalAppender.append(frameNum);
+			rootJniLocalAppender.endRow();
+			totalRecordsProcessed++;
+			periodicCommitIfNeeded();
+		} catch (Exception e) {
+			e.printStackTrace();
+		}
 	}
 
 	@Override
 	public void rootJavaFrame(long objId, int threadSerialNum, int frameNum) {
-		exportRoot("root_java_frame", objId, threadSerialNum, frameNum);
+		try {
+			rootJavaFrameAppender.beginRow();
+			rootJavaFrameAppender.append(objId);
+			rootJavaFrameAppender.append(threadSerialNum);
+			rootJavaFrameAppender.append(frameNum);
+			rootJavaFrameAppender.endRow();
+			totalRecordsProcessed++;
+			periodicCommitIfNeeded();
+		} catch (Exception e) {
+			e.printStackTrace();
+		}
 	}
 
 	@Override
 	public void rootNativeStack(long objId, int threadSerialNum) {
-		exportRoot("root_native_stack", objId, threadSerialNum);
+		try {
+			rootNativeStackAppender.beginRow();
+			rootNativeStackAppender.append(objId);
+			rootNativeStackAppender.append(threadSerialNum);
+			rootNativeStackAppender.endRow();
+			totalRecordsProcessed++;
+			periodicCommitIfNeeded();
+		} catch (Exception e) {
+			e.printStackTrace();
+		}
 	}
 
 	@Override
 	public void rootStickyClass(long objId) {
-		exportRoot("root_sticky_class", objId);
+		try {
+			rootStickyClassAppender.beginRow();
+			rootStickyClassAppender.append(objId);
+			rootStickyClassAppender.endRow();
+			totalRecordsProcessed++;
+			periodicCommitIfNeeded();
+		} catch (Exception e) {
+			e.printStackTrace();
+		}
 	}
 
 	@Override
 	public void rootThreadBlock(long objId, int threadSerialNum) {
-		exportRoot("root_thread_block", objId, threadSerialNum);
+		try {
+			rootThreadBlockAppender.beginRow();
+			rootThreadBlockAppender.append(objId);
+			rootThreadBlockAppender.append(threadSerialNum);
+			rootThreadBlockAppender.endRow();
+			totalRecordsProcessed++;
+			periodicCommitIfNeeded();
+		} catch (Exception e) {
+			e.printStackTrace();
+		}
 	}
 
 	@Override
 	public void rootMonitorUsed(long objId) {
-		exportRoot("root_monitor_used", objId);
+		try {
+			rootMonitorUsedAppender.beginRow();
+			rootMonitorUsedAppender.append(objId);
+			rootMonitorUsedAppender.endRow();
+			totalRecordsProcessed++;
+			periodicCommitIfNeeded();
+		} catch (Exception e) {
+			e.printStackTrace();
+		}
 	}
 
 	@Override
 	public void rootThreadObj(long objId, int threadSerialNum, int stackTraceSerialNum) {
-		exportRoot("root_thread_obj", objId, threadSerialNum, stackTraceSerialNum);
+		try {
+			rootThreadObjAppender.beginRow();
+			rootThreadObjAppender.append(objId);
+			rootThreadObjAppender.append(threadSerialNum);
+			rootThreadObjAppender.append(stackTraceSerialNum);
+			rootThreadObjAppender.endRow();
+			totalRecordsProcessed++;
+			periodicCommitIfNeeded();
+		} catch (Exception e) {
+			e.printStackTrace();
+		}
 	}
 
-	private void exportRoot(String table, Object... values) {
+	private void periodicCommitIfNeeded() {
 		try {
-			StringBuilder insert = new StringBuilder("INSERT INTO ").append(table).append(" VALUES (");
-			for (int i = 0; i < values.length; i++) {
-				insert.append("?");
-				if (i < values.length - 1)
-					insert.append(", ");
-			}
-			insert.append(")");
-
-			try (PreparedStatement ps = conn.prepareStatement(insert.toString())) {
-				for (int i = 0; i < values.length; i++) {
-					ps.setObject(i + 1, values[i]);
-				}
-				ps.executeUpdate();
+			if (totalRecordsProcessed % COMMIT_INTERVAL == 0) {
+				conn.commit();
+				System.out.println(
+						"[DuckDB] Progress: " + String.format("%,d", totalRecordsProcessed) + " records committed");
 			}
 		} catch (SQLException e) {
 			e.printStackTrace();
@@ -547,61 +634,43 @@ public class DuckDbExportHandler extends NullRecordHandler {
 	}
 
 	public void close() throws Exception {
-		System.out.println("[DuckDB] Flushing remaining batches...");
+		System.out.println("[DuckDB] Flushing appenders and finishing export...");
 
-		// Flush all remaining batches
+		// close appenders (flush)
+		closeAppenderQuiet(stringsAppender);
+		closeAppenderQuiet(classesAppender);
+		closeAppenderQuiet(threadsAppender);
+		closeAppenderQuiet(heapSummaryAppender);
+		closeAppenderQuiet(instancesAppender);
+		closeAppenderQuiet(instanceFieldsObjectAppender);
+		closeAppenderQuiet(instanceFieldsBooleanAppender);
+		closeAppenderQuiet(instanceFieldsCharAppender);
+		closeAppenderQuiet(instanceFieldsFloatAppender);
+		closeAppenderQuiet(instanceFieldsDoubleAppender);
+		closeAppenderQuiet(instanceFieldsByteAppender);
+		closeAppenderQuiet(instanceFieldsShortAppender);
+		closeAppenderQuiet(instanceFieldsIntAppender);
+		closeAppenderQuiet(instanceFieldsLongAppender);
+		closeAppenderQuiet(classDumpsAppender);
+		closeAppenderQuiet(objArraysAppender);
+		closeAppenderQuiet(primArraysAppender);
+
+		closeAppenderQuiet(rootUnknownAppender);
+		closeAppenderQuiet(rootJniGlobalAppender);
+		closeAppenderQuiet(rootJniLocalAppender);
+		closeAppenderQuiet(rootJavaFrameAppender);
+		closeAppenderQuiet(rootNativeStackAppender);
+		closeAppenderQuiet(rootStickyClassAppender);
+		closeAppenderQuiet(rootThreadBlockAppender);
+		closeAppenderQuiet(rootMonitorUsedAppender);
+		closeAppenderQuiet(rootThreadObjAppender);
+
+		// Final commit
 		try {
-			if (stringBatchCount > 0 && stringStmt != null && !stringStmt.isClosed()) {
-				stringStmt.executeBatch();
-			}
-			if (classBatchCount > 0 && classStmt != null && !classStmt.isClosed()) {
-				classStmt.executeBatch();
-			}
-			if (instanceBatchCount > 0 && instanceStmt != null && !instanceStmt.isClosed()) {
-				instanceStmt.executeBatch();
-			}
-			if (instanceFieldBatchCount > 0 && instanceFieldStmt != null && !instanceFieldStmt.isClosed()) {
-				instanceFieldStmt.executeBatch();
-			}
-			if (classDumpBatchCount > 0 && classDumpStmt != null && !classDumpStmt.isClosed()) {
-				classDumpStmt.executeBatch();
-			}
-			if (objArrayBatchCount > 0 && objArrayStmt != null && !objArrayStmt.isClosed()) {
-				objArrayStmt.executeBatch();
-			}
-			if (primArrayBatchCount > 0 && primArrayStmt != null && !primArrayStmt.isClosed()) {
-				primArrayStmt.executeBatch();
-			}
-
 			conn.commit();
 		} catch (SQLException e) {
-			System.err.println("[DuckDB] Error flushing batches: " + e.getMessage());
-			e.printStackTrace();
+			System.err.println("[DuckDB] Error committing: " + e.getMessage());
 		}
-
-		// Close prepared statements
-		try {
-			if (stringStmt != null && !stringStmt.isClosed())
-				stringStmt.close();
-			if (classStmt != null && !classStmt.isClosed())
-				classStmt.close();
-			if (instanceStmt != null && !instanceStmt.isClosed())
-				instanceStmt.close();
-			if (instanceFieldStmt != null && !instanceFieldStmt.isClosed())
-				instanceFieldStmt.close();
-			if (classDumpStmt != null && !classDumpStmt.isClosed())
-				classDumpStmt.close();
-			if (objArrayStmt != null && !objArrayStmt.isClosed())
-				objArrayStmt.close();
-			if (primArrayStmt != null && !primArrayStmt.isClosed())
-				primArrayStmt.close();
-		} catch (SQLException e) {
-			System.err.println("[DuckDB] Error closing statements: " + e.getMessage());
-		}
-
-		// Shutdown executor
-		flushExecutor.shutdown();
-		flushExecutor.awaitTermination(1, TimeUnit.MINUTES);
 
 		// Create indexes for query performance
 		System.out.println("[DuckDB] Creating indexes...");
@@ -648,5 +717,24 @@ public class DuckDbExportHandler extends NullRecordHandler {
 		System.out.println("========================================");
 		System.out.println("  Database: " + dbPath);
 		System.out.println("  Status: Optimized and indexed");
+	}
+
+	private void closeAppenderQuiet(DuckDBAppender app) {
+		if (app == null)
+			return;
+		try {
+			app.close();
+		} catch (Exception e) {
+			System.err.println("[DuckDB] Error closing appender: " + e.getMessage());
+		}
+	}
+
+	private void closeQuiet() {
+		try {
+			if (conn != null && !conn.isClosed())
+				conn.close();
+		} catch (SQLException e) {
+			// ignore
+		}
 	}
 }
