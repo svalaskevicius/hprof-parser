@@ -44,7 +44,16 @@ public class DuckDbExportHandler extends NullRecordHandler {
 	private DuckDBAppender instancesAppender;
 	private DuckDBAppender classDumpsAppender;
 	private DuckDBAppender objArraysAppender;
-	private DuckDBAppender primArraysAppender;
+
+	// Type-specific primitive array tables
+	private DuckDBAppender primArraysBooleanAppender;
+	private DuckDBAppender primArraysCharAppender;
+	private DuckDBAppender primArraysFloatAppender;
+	private DuckDBAppender primArraysDoubleAppender;
+	private DuckDBAppender primArraysByteAppender;
+	private DuckDBAppender primArraysShortAppender;
+	private DuckDBAppender primArraysIntAppender;
+	private DuckDBAppender primArraysLongAppender;
 
 	// Type-specific instance field tables
 	private DuckDBAppender instanceFieldsObjectAppender;
@@ -111,8 +120,23 @@ public class DuckDbExportHandler extends NullRecordHandler {
 						"CREATE TABLE IF NOT EXISTS class_dumps (classObjId BIGINT, stackTraceSerialNum INT, superClassObjId BIGINT, classLoaderObjId BIGINT, signersObjId BIGINT, protectionDomainObjId BIGINT, reserved1 BIGINT, reserved2 BIGINT, instanceSize INT, constants VARCHAR, statics VARCHAR, instanceFields VARCHAR)");
 				stmt.executeUpdate(
 						"CREATE TABLE IF NOT EXISTS obj_arrays (objId BIGINT, stackTraceSerialNum INT, elemClassObjId BIGINT, elems BIGINT[])");
+				// Type-specific primitive array tables
 				stmt.executeUpdate(
-						"CREATE TABLE IF NOT EXISTS prim_arrays (objId BIGINT, stackTraceSerialNum INT, elemType SMALLINT, elems VARCHAR[])");
+						"CREATE TABLE IF NOT EXISTS prim_arrays_boolean (objId BIGINT, stackTraceSerialNum INT, elems BOOLEAN[])");
+				stmt.executeUpdate(
+						"CREATE TABLE IF NOT EXISTS prim_arrays_char (objId BIGINT, stackTraceSerialNum INT, elems VARCHAR)");
+				stmt.executeUpdate(
+						"CREATE TABLE IF NOT EXISTS prim_arrays_float (objId BIGINT, stackTraceSerialNum INT, elems FLOAT[])");
+				stmt.executeUpdate(
+						"CREATE TABLE IF NOT EXISTS prim_arrays_double (objId BIGINT, stackTraceSerialNum INT, elems DOUBLE[])");
+				stmt.executeUpdate(
+						"CREATE TABLE IF NOT EXISTS prim_arrays_byte (objId BIGINT, stackTraceSerialNum INT, elems TINYINT[])");
+				stmt.executeUpdate(
+						"CREATE TABLE IF NOT EXISTS prim_arrays_short (objId BIGINT, stackTraceSerialNum INT, elems SMALLINT[])");
+				stmt.executeUpdate(
+						"CREATE TABLE IF NOT EXISTS prim_arrays_int (objId BIGINT, stackTraceSerialNum INT, elems INTEGER[])");
+				stmt.executeUpdate(
+						"CREATE TABLE IF NOT EXISTS prim_arrays_long (objId BIGINT, stackTraceSerialNum INT, elems BIGINT[])");
 
 				// Type-specific instance field tables
 				stmt.executeUpdate(
@@ -159,7 +183,16 @@ public class DuckDbExportHandler extends NullRecordHandler {
 			instancesAppender = dconn.createAppender("main", "instances");
 			classDumpsAppender = dconn.createAppender("main", "class_dumps");
 			objArraysAppender = dconn.createAppender("main", "obj_arrays");
-			primArraysAppender = dconn.createAppender("main", "prim_arrays");
+
+			// Type-specific primitive array appenders
+			primArraysBooleanAppender = dconn.createAppender("main", "prim_arrays_boolean");
+			primArraysCharAppender = dconn.createAppender("main", "prim_arrays_char");
+			primArraysFloatAppender = dconn.createAppender("main", "prim_arrays_float");
+			primArraysDoubleAppender = dconn.createAppender("main", "prim_arrays_double");
+			primArraysByteAppender = dconn.createAppender("main", "prim_arrays_byte");
+			primArraysShortAppender = dconn.createAppender("main", "prim_arrays_short");
+			primArraysIntAppender = dconn.createAppender("main", "prim_arrays_int");
+			primArraysLongAppender = dconn.createAppender("main", "prim_arrays_long");
 
 			// Type-specific appenders
 			instanceFieldsObjectAppender = dconn.createAppender("main", "instance_fields_object");
@@ -474,14 +507,71 @@ public class DuckDbExportHandler extends NullRecordHandler {
 	public void primArrayDump(long objId, int stackTraceSerialNum, byte elemType, Value<?>[] elems) {
 		primArrayCount++;
 		try {
-			primArraysAppender.beginRow();
-			primArraysAppender.append(objId);
-			primArraysAppender.append(stackTraceSerialNum);
-			primArraysAppender.append((short) elemType);
+			// Convert Value<?> array to appropriate typed array
+			List<?> typedElems = Arrays.stream(elems).map(v -> v.value).collect(Collectors.toList());
 
-			primArraysAppender.append(Arrays.stream(elems).map(String::valueOf).collect(Collectors.toList()));
+			switch (Type.hprofTypeToEnum(elemType)) {
+			case Type.BOOL:
+				primArraysBooleanAppender.beginRow();
+				primArraysBooleanAppender.append(objId);
+				primArraysBooleanAppender.append(stackTraceSerialNum);
+				primArraysBooleanAppender.append(typedElems);
+				primArraysBooleanAppender.endRow();
+				break;
+			case Type.CHAR:
+                String result = typedElems.stream().collect(StringBuilder::new, StringBuilder::append, StringBuilder::append).toString();
+				primArraysCharAppender.beginRow();
+				primArraysCharAppender.append(objId);
+				primArraysCharAppender.append(stackTraceSerialNum);
+				primArraysCharAppender.append(result);
+				primArraysCharAppender.endRow();
+				break;
+			case Type.FLOAT:
+				primArraysFloatAppender.beginRow();
+				primArraysFloatAppender.append(objId);
+				primArraysFloatAppender.append(stackTraceSerialNum);
+				primArraysFloatAppender.append(typedElems);
+				primArraysFloatAppender.endRow();
+				break;
+			case Type.DOUBLE:
+				primArraysDoubleAppender.beginRow();
+				primArraysDoubleAppender.append(objId);
+				primArraysDoubleAppender.append(stackTraceSerialNum);
+				primArraysDoubleAppender.append(typedElems);
+				primArraysDoubleAppender.endRow();
+				break;
+			case Type.BYTE:
+				primArraysByteAppender.beginRow();
+				primArraysByteAppender.append(objId);
+				primArraysByteAppender.append(stackTraceSerialNum);
+				primArraysByteAppender.append(typedElems);
+				primArraysByteAppender.endRow();
+				break;
+			case Type.SHORT:
+				primArraysShortAppender.beginRow();
+				primArraysShortAppender.append(objId);
+				primArraysShortAppender.append(stackTraceSerialNum);
+				primArraysShortAppender.append(typedElems);
+				primArraysShortAppender.endRow();
+				break;
+			case Type.INT:
+				primArraysIntAppender.beginRow();
+				primArraysIntAppender.append(objId);
+				primArraysIntAppender.append(stackTraceSerialNum);
+				primArraysIntAppender.append(typedElems);
+				primArraysIntAppender.endRow();
+				break;
+			case Type.LONG:
+				primArraysLongAppender.beginRow();
+				primArraysLongAppender.append(objId);
+				primArraysLongAppender.append(stackTraceSerialNum);
+				primArraysLongAppender.append(typedElems);
+				primArraysLongAppender.endRow();
+				break;
+			default:
+				throw new Exception("Cannot export prim array type " + String.valueOf(elemType));
+			}
 
-			primArraysAppender.endRow();
 			totalRecordsProcessed++;
 
 			if (primArrayCount % 25_000 == 0) {
@@ -653,7 +743,16 @@ public class DuckDbExportHandler extends NullRecordHandler {
 		closeAppenderQuiet(instanceFieldsLongAppender);
 		closeAppenderQuiet(classDumpsAppender);
 		closeAppenderQuiet(objArraysAppender);
-		closeAppenderQuiet(primArraysAppender);
+
+		// Close primitive array appenders
+		closeAppenderQuiet(primArraysBooleanAppender);
+		closeAppenderQuiet(primArraysCharAppender);
+		closeAppenderQuiet(primArraysFloatAppender);
+		closeAppenderQuiet(primArraysDoubleAppender);
+		closeAppenderQuiet(primArraysByteAppender);
+		closeAppenderQuiet(primArraysShortAppender);
+		closeAppenderQuiet(primArraysIntAppender);
+		closeAppenderQuiet(primArraysLongAppender);
 
 		closeAppenderQuiet(rootUnknownAppender);
 		closeAppenderQuiet(rootJniGlobalAppender);
@@ -680,16 +779,35 @@ public class DuckDbExportHandler extends NullRecordHandler {
 			stmt.execute("CREATE INDEX IF NOT EXISTS idx_instances_objid ON instances(objId)");
 			stmt.execute("CREATE INDEX IF NOT EXISTS idx_instances_classid ON instances(classObjId)");
 
-			stmt.execute("CREATE INDEX IF NOT EXISTS idx_instance_fields_object_objid ON instance_fields_object(instanceObjId)");
-			stmt.execute("CREATE INDEX IF NOT EXISTS idx_instance_fields_boolean_objid ON instance_fields_boolean(instanceObjId)");
-			stmt.execute("CREATE INDEX IF NOT EXISTS idx_instance_fields_char_objid ON instance_fields_char(instanceObjId)");
-			stmt.execute("CREATE INDEX IF NOT EXISTS idx_instance_fields_float_objid ON instance_fields_float(instanceObjId)");
-			stmt.execute("CREATE INDEX IF NOT EXISTS idx_instance_fields_double_objid ON instance_fields_double(instanceObjId)");
-			stmt.execute("CREATE INDEX IF NOT EXISTS idx_instance_fields_byte_objid ON instance_fields_byte(instanceObjId)");
-			stmt.execute("CREATE INDEX IF NOT EXISTS idx_instance_fields_short_objid ON instance_fields_short(instanceObjId)");
-			stmt.execute("CREATE INDEX IF NOT EXISTS idx_instance_fields_int_objid ON instance_fields_int(instanceObjId)");
-			stmt.execute("CREATE INDEX IF NOT EXISTS idx_instance_fields_long_objid ON instance_fields_long(instanceObjId)");
+			stmt.execute(
+					"CREATE INDEX IF NOT EXISTS idx_instance_fields_object_objid ON instance_fields_object(instanceObjId)");
+			stmt.execute(
+					"CREATE INDEX IF NOT EXISTS idx_instance_fields_boolean_objid ON instance_fields_boolean(instanceObjId)");
+			stmt.execute(
+					"CREATE INDEX IF NOT EXISTS idx_instance_fields_char_objid ON instance_fields_char(instanceObjId)");
+			stmt.execute(
+					"CREATE INDEX IF NOT EXISTS idx_instance_fields_float_objid ON instance_fields_float(instanceObjId)");
+			stmt.execute(
+					"CREATE INDEX IF NOT EXISTS idx_instance_fields_double_objid ON instance_fields_double(instanceObjId)");
+			stmt.execute(
+					"CREATE INDEX IF NOT EXISTS idx_instance_fields_byte_objid ON instance_fields_byte(instanceObjId)");
+			stmt.execute(
+					"CREATE INDEX IF NOT EXISTS idx_instance_fields_short_objid ON instance_fields_short(instanceObjId)");
+			stmt.execute(
+					"CREATE INDEX IF NOT EXISTS idx_instance_fields_int_objid ON instance_fields_int(instanceObjId)");
+			stmt.execute(
+					"CREATE INDEX IF NOT EXISTS idx_instance_fields_long_objid ON instance_fields_long(instanceObjId)");
 			stmt.execute("CREATE INDEX IF NOT EXISTS idx_class_dumps_objid ON class_dumps(classObjId)");
+
+			// Indexes for primitive array tables
+			stmt.execute("CREATE INDEX IF NOT EXISTS idx_prim_arrays_boolean_objid ON prim_arrays_boolean(objId)");
+			stmt.execute("CREATE INDEX IF NOT EXISTS idx_prim_arrays_char_objid ON prim_arrays_char(objId)");
+			stmt.execute("CREATE INDEX IF NOT EXISTS idx_prim_arrays_float_objid ON prim_arrays_float(objId)");
+			stmt.execute("CREATE INDEX IF NOT EXISTS idx_prim_arrays_double_objid ON prim_arrays_double(objId)");
+			stmt.execute("CREATE INDEX IF NOT EXISTS idx_prim_arrays_byte_objid ON prim_arrays_byte(objId)");
+			stmt.execute("CREATE INDEX IF NOT EXISTS idx_prim_arrays_short_objid ON prim_arrays_short(objId)");
+			stmt.execute("CREATE INDEX IF NOT EXISTS idx_prim_arrays_int_objid ON prim_arrays_int(objId)");
+			stmt.execute("CREATE INDEX IF NOT EXISTS idx_prim_arrays_long_objid ON prim_arrays_long(objId)");
 
 			conn.commit();
 		} catch (SQLException e) {
