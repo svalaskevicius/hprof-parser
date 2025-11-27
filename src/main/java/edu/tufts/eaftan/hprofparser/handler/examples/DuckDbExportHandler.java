@@ -679,8 +679,18 @@ public class DuckDbExportHandler extends NullRecordHandler {
 			stmt.execute("CREATE INDEX IF NOT EXISTS idx_classes_objid ON classes(classObjId)");
 			stmt.execute("CREATE INDEX IF NOT EXISTS idx_instances_objid ON instances(objId)");
 			stmt.execute("CREATE INDEX IF NOT EXISTS idx_instances_classid ON instances(classObjId)");
-			stmt.execute("CREATE INDEX IF NOT EXISTS idx_instance_fields_objid ON instance_fields(instanceObjId)");
+
+			stmt.execute("CREATE INDEX IF NOT EXISTS idx_instance_fields_object_objid ON instance_fields_object(instanceObjId)");
+			stmt.execute("CREATE INDEX IF NOT EXISTS idx_instance_fields_boolean_objid ON instance_fields_boolean(instanceObjId)");
+			stmt.execute("CREATE INDEX IF NOT EXISTS idx_instance_fields_char_objid ON instance_fields_char(instanceObjId)");
+			stmt.execute("CREATE INDEX IF NOT EXISTS idx_instance_fields_float_objid ON instance_fields_float(instanceObjId)");
+			stmt.execute("CREATE INDEX IF NOT EXISTS idx_instance_fields_double_objid ON instance_fields_double(instanceObjId)");
+			stmt.execute("CREATE INDEX IF NOT EXISTS idx_instance_fields_byte_objid ON instance_fields_byte(instanceObjId)");
+			stmt.execute("CREATE INDEX IF NOT EXISTS idx_instance_fields_short_objid ON instance_fields_short(instanceObjId)");
+			stmt.execute("CREATE INDEX IF NOT EXISTS idx_instance_fields_int_objid ON instance_fields_int(instanceObjId)");
+			stmt.execute("CREATE INDEX IF NOT EXISTS idx_instance_fields_long_objid ON instance_fields_long(instanceObjId)");
 			stmt.execute("CREATE INDEX IF NOT EXISTS idx_class_dumps_objid ON class_dumps(classObjId)");
+
 			conn.commit();
 		} catch (SQLException e) {
 			System.err.println("[DuckDB] Error creating indexes: " + e.getMessage());
